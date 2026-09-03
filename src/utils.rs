@@ -1,3 +1,13 @@
+// This file was modified in a fork of jaskang/wukong-minimap.
+//
+// Upstream: https://github.com/jaskang/wukong-minimap (Apache-2.0)
+// Fork:     https://github.com/Ouye/wukong-minimap
+//
+// Changes: image_with_file returns Option instead of panicking (it is now
+// called during gameplay); default log level lowered to info.
+//
+// See CHANGES.md for the full record of what was changed and why.
+
 use hudhook::tracing;
 use image::{ImageFormat, ImageReader, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -55,7 +65,11 @@ pub fn setup_tracing() {
     // hudhook::alloc_console().unwrap();
     // hudhook::enable_console_colors();
     // dotenv::dotenv().ok();
-    std::env::set_var("RUST_LOG", "debug");
+    // Release default. Set RUST_LOG=debug before launching the game to get the
+    // per-texture and per-frame chatter back.
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
 
     let log_file = hudhook::util::get_dll_path()
         .map(|mut path| {
@@ -108,17 +122,24 @@ pub fn image_with_bytes(bytes: &[u8], format: ImageFormat) -> RgbaImage {
         .into_rgba8()
 }
 
-pub fn image_with_file(file: &str) -> RgbaImage {
-    let dll_dir = get_dll_dir();
-    let file_path = dll_dir.join("maps").join(file);
-    let image = ImageReader::open(&file_path)
-        .unwrap_or_else(|_| panic!("Failed to open image: {}", file_path.display()))
-        .with_guessed_format()
-        .unwrap()
-        .decode()
-        .unwrap()
-        .into_rgba8();
-    image
+/// Load a map image from `maps/` next to the dll.
+///
+/// Returns None instead of panicking: this is now called during gameplay
+/// (maps are loaded on demand when the player changes area), and a missing or
+/// corrupt file should cost the minimap, not the game.
+pub fn image_with_file(file: &str) -> Option<RgbaImage> {
+    let file_path = get_dll_dir().join("maps").join(file);
+    match ImageReader::open(&file_path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.decode().map_err(|e| e.to_string()))
+    {
+        Ok(img) => Some(img.into_rgba8()),
+        Err(e) => {
+            tracing::error!("failed to load map image {}: {e}", file_path.display());
+            None
+        }
+    }
 }
 
 pub fn load_data() -> Vec<MapInfo> {
