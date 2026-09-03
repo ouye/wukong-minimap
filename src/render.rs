@@ -1,3 +1,14 @@
+// This file was modified in a fork of jaskang/wukong-minimap.
+//
+// Upstream: https://github.com/jaskang/wukong-minimap (Apache-2.0)
+// Fork:     https://github.com/Ouye/wukong-minimap
+//
+// Changes: maps are loaded on demand instead of all at once; the nomap
+// placeholder is resized to match the map textures; replace_texture
+// failures are logged.
+//
+// See CHANGES.md for the full record of what was changed and why.
+
 use std::{collections::HashMap, sync::Mutex};
 
 use crate::{
@@ -40,12 +51,6 @@ impl ImageTexture {
             image: image_with_bytes(types, format),
         }
     }
-    pub fn _with_file(file: &str) -> Self {
-        Self {
-            id: None,
-            image: image_with_file(file),
-        }
-    }
 }
 
 struct Textures {
@@ -85,6 +90,10 @@ struct Textures {
 }
 
 // 定义宏来简化纹理创建，仅适用于PNG格式
+/// Edge length of the map textures. The images in `maps/` are authored at this
+/// size and the placeholder is resized to match.
+const MAP_SIZE: u32 = 2000;
+
 macro_rules! png_texture {
     ($file:expr) => {
         ImageTexture::with_bytes(include_bytes!($file), ImageFormat::Png)
@@ -114,10 +123,18 @@ impl MiniMap {
         let points: HashMap<String, Vec<Point>> = load_points();
 
         let textures = Textures {
-            map: ImageTexture::with_bytes(
-                include_bytes!("../includes/nomap.webp"),
-                ImageFormat::WebP,
-            ),
+            // The placeholder fixes the map texture's dimensions for the whole
+            // session -- replace_texture refuses a size change -- so it has to
+            // match the map images, which are 2000x2000.
+            map: ImageTexture {
+                id: None,
+                image: image::imageops::resize(
+                    &image_with_bytes(include_bytes!("../includes/nomap.webp"), ImageFormat::WebP),
+                    MAP_SIZE,
+                    MAP_SIZE,
+                    image::imageops::FilterType::Triangle,
+                ),
+            },
             mapwraper: png_texture!("../includes/mapwraper.png"),
             mainwraper: png_texture!("../includes/mainwraper.png"),
             mapplayer: png_texture!("../includes/icon_player.png"),
@@ -140,11 +157,10 @@ impl MiniMap {
             bianhua: png_texture!("../includes/icon_bianhua.png"),
         };
 
-        let mut map_images = HashMap::new();
-        // 加载地图图片
-        maps.iter().for_each(|map| {
-            map_images.insert(map.key.clone(), image_with_file(map.key.as_str()));
-        });
+        // Maps are loaded on demand in before_render, not all at once. The
+        // full set is 23 images; at 2000x2000 RGBA that would be 368 MB of
+        // resident memory for images the player is not looking at.
+        let map_images: HashMap<String, RgbaImage> = HashMap::new();
 
         let gilrs = Gilrs::new().unwrap();
         Self {
@@ -491,7 +507,6 @@ impl MiniMap {
                     );
 
                     let (uv_min, uv_max) = self.get_map_uv(map, &map_view);
-
                     draw_list
                         .add_image_rounded(
                             map_image,
@@ -694,15 +709,25 @@ impl ImguiRenderLoop for MiniMap {
     ) {
         let map = self.update_map();
         if let Some(map) = map {
-            tracing::info!("update map: {:?} game: {:?}", map, self.game);
-            let map_image = self.map_images.get(map.key.as_str());
-            if let Some(map_image) = map_image {
-                let _ = render_context.replace_texture(
+            tracing::info!("update map: {} at {:?}", map.key, (self.game.x, self.game.y));
+
+            // Load on demand and keep only the current map resident.
+            if !self.map_images.contains_key(map.key.as_str()) {
+                self.map_images.clear();
+                if let Some(img) = image_with_file(map.key.as_str()) {
+                    self.map_images.insert(map.key.clone(), img);
+                }
+            }
+
+            if let Some(map_image) = self.map_images.get(map.key.as_str()) {
+                if let Err(e) = render_context.replace_texture(
                     self.textures.map.id.unwrap(),
                     map_image.as_bytes(),
                     map_image.width(),
                     map_image.height(),
-                );
+                ) {
+                    tracing::error!("replace_texture failed for {}: {e:?}", map.key);
+                }
             }
             self.map = Some(map);
         }
