@@ -1,3 +1,17 @@
+// This file was modified in a fork of jaskang/wukong-minimap.
+//
+// Upstream: https://github.com/jaskang/wukong-minimap (Apache-2.0)
+// Fork:     https://github.com/Ouye/wukong-minimap
+//
+// Vendored from veeenu/hudhook 0.8.2 (MIT), then modified.
+//
+// Changes: track resource state so re-uploads are legal; keep textures in
+// COMMON for cross-queue ownership transfer; use GetCopyableFootprints;
+// upload through a CPU-writable CUSTOM heap with WriteToSubresource; clamp
+// alpha 255 -> 254 to work around opaque-texture corruption on this game.
+//
+// See CHANGES.md for the full record of what was changed and why.
+
 // NOTE: see this for ManuallyDrop instances https://github.com/microsoft/windows-rs/issues/2386
 
 use std::ffi::c_void;
@@ -6,7 +20,7 @@ use std::{mem, ptr, slice};
 
 use imgui::internal::RawWrapper;
 use imgui::{BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
-use tracing::error;
+use tracing::{debug, error};
 use windows::core::{s, w, Error, Interface, Result, HRESULT};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::*;
@@ -645,8 +659,34 @@ impl<T> Buffer<T> {
 struct Texture {
     resource: ID3D12Resource,
     gpu_desc: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// Logical size the caller asked for.
     width: u32,
     height: u32,
+    /// Size actually allocated. A square power-of-two texture samples as
+    /// garbage on this game's D3D12 driver -- those are exactly the
+    /// dimensions for which the driver picks its optimal swizzled layout
+    /// (D3D12_TEXTURE_LAYOUT_UNKNOWN lets it choose), and that layout does not
+    /// survive the CopyTextureRegion path here. 2000x2000 renders fine while
+    /// 2048x2048 does not, at identical byte sizes; likewise 4000 vs 4096.
+    /// Padding any power-of-two dimension by one texel keeps the driver on a
+    /// layout that works. The padding column/row duplicates its neighbour, so
+    /// sampling uv 0..1 looks unchanged.
+    alloc_width: u32,
+    alloc_height: u32,
+    /// True when the resource lives on a CPU-writable CUSTOM heap and is
+    /// filled with WriteToSubresource instead of CopyTextureRegion.
+    cpu_writable: bool,
+    /// The state the resource is currently left in.
+    ///
+    /// Without this, `upload_texture` is only correct the *first* time it runs:
+    /// it unconditionally copies into the resource and then emits a
+    /// COPY_DEST -> PIXEL_SHADER_RESOURCE barrier. On any later call (i.e. via
+    /// `replace_texture`) the resource is already in PIXEL_SHADER_RESOURCE, so
+    /// the copy targets a resource that is not in COPY_DEST and the barrier
+    /// declares a StateBefore that does not match reality. Both are undefined
+    /// behaviour; in practice the upload silently does not land and the texture
+    /// samples as garbage.
+    state: D3D12_RESOURCE_STATES,
 }
 
 struct TextureHeap {
@@ -753,6 +793,13 @@ impl TextureHeap {
     unsafe fn create_texture(&mut self, width: u32, height: u32) -> Result<TextureId> {
         self.resize_heap()?;
 
+        // (An earlier attempt padded power-of-two dimensions by one texel on the
+        // theory that the driver's swizzled layout for those sizes was the
+        // problem. It made no difference -- 4096 allocated as 4097x4097 was
+        // still corrupt -- so the plumbing stays but the padding is off.)
+        let alloc_width = width;
+        let alloc_height = height;
+
         let cpu_heap_stg_start = self.srv_staging_heap.GetCPUDescriptorHandleForHeapStart();
         let cpu_heap_start = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
         let gpu_heap_start = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
@@ -773,7 +820,59 @@ impl TextureHeap {
             ptr: gpu_heap_start.ptr + (texture_index * heap_inc_size) as u64,
         };
 
-        let texture: ID3D12Resource = util::try_out_ptr(|v| unsafe {
+        // Preferred path: a CPU-writable CUSTOM heap, filled with
+        // WriteToSubresource.
+        //
+        // The usual DEFAULT-heap + upload-buffer + CopyTextureRegion path was
+        // verified to hand the GPU byte-perfect data (the upload buffer is read
+        // back and measured just before the copy), and the result still comes
+        // out with the image's structure intact but its texels shuffled within
+        // small blocks -- the signature of the driver's tiled/swizzled texture
+        // layout not being applied by the copy. WriteToSubresource performs
+        // that same linear->tiled conversion on the CPU inside the driver, so
+        // it sidesteps CopyTextureRegion, the upload buffer, the second command
+        // queue, the fence and the resource barriers entirely.
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: alloc_width as _,
+            Height: alloc_height as _,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+
+        let custom: Option<ID3D12Resource> = util::try_out_ptr(|v| unsafe {
+            self.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    CreationNodeMask: 1,
+                    VisibleNodeMask: 1,
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                v,
+            )
+        })
+        .ok();
+
+        let cpu_writable = custom.is_some();
+        if cpu_writable {
+            debug!("create_texture {alloc_width}x{alloc_height}: CPU-writable CUSTOM heap");
+        } else {
+            debug!("create_texture {alloc_width}x{alloc_height}: CUSTOM heap unavailable, using upload+copy");
+        }
+
+        let texture: ID3D12Resource = match custom {
+            Some(t) => t,
+            None => util::try_out_ptr(|v| unsafe {
             self.device.CreateCommittedResource(
                 &D3D12_HEAP_PROPERTIES {
                     Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -786,8 +885,8 @@ impl TextureHeap {
                 &D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                     Alignment: 0,
-                    Width: width as _,
-                    Height: height as _,
+                    Width: alloc_width as _,
+                    Height: alloc_height as _,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
                     Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -795,11 +894,16 @@ impl TextureHeap {
                     Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
                     Flags: D3D12_RESOURCE_FLAG_NONE,
                 },
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                // COMMON, not COPY_DEST: this resource is touched by two
+                // different queues, and COMMON is the only state from which
+                // D3D12 will hand ownership between them. The copy below
+                // promotes it to COPY_DEST implicitly.
+                D3D12_RESOURCE_STATE_COMMON,
                 None,
                 v,
             )
-        })?;
+            })?,
+        };
 
         self.device.CreateShaderResourceView(
             &texture,
@@ -827,7 +931,20 @@ impl TextureHeap {
         );
 
         let id = TextureId::from(self.textures.len());
-        self.textures.push(Texture { resource: texture.clone(), gpu_desc, width, height });
+        self.textures.push(Texture {
+            resource: texture.clone(),
+            gpu_desc,
+            width,
+            height,
+            alloc_width,
+            alloc_height,
+            cpu_writable,
+            state: if cpu_writable {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            },
+        });
 
         Ok(id)
     }
@@ -839,19 +956,93 @@ impl TextureHeap {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let texture = &self.textures[texture_id.id()];
-        if texture.width != width || texture.height != height {
-            error!(
-                "image size {width}x{height} do not match expected {}x{}",
-                texture.width, texture.height
-            );
-            return Err(Error::from_hresult(HRESULT(-1)));
+        let (tex_resource, tex_state, alloc_width, alloc_height, cpu_writable) = {
+            let texture = &self.textures[texture_id.id()];
+            if texture.width != width || texture.height != height {
+                error!(
+                    "image size {width}x{height} do not match expected {}x{}",
+                    texture.width, texture.height
+                );
+                return Err(Error::from_hresult(HRESULT(-1)));
+            }
+            (
+                texture.resource.clone(),
+                texture.state,
+                texture.alloc_width,
+                texture.alloc_height,
+                texture.cpu_writable,
+            )
+        };
+
+        // WORKAROUND: clamp alpha 255 -> 254.
+        //
+        // On this game + driver, any texel uploaded with alpha == 255 comes
+        // back from the sampler scrambled, while the identical pixels uploaded
+        // with alpha == 200 sample perfectly. Verified in both directions: the
+        // map (opaque, always corrupt) renders correctly at alpha 200, and
+        // mapwraper (mostly transparent, always fine) breaks when its alpha is
+        // forced to 255. Nothing about the upload path matters -- the same
+        // corruption survives CopyTextureRegion, WriteToSubresource, every
+        // pitch, size, heap type, resource state and queue arrangement tried.
+        //
+        // The strong suspicion is the game's frame-generation UI handling
+        // (1.0.20 integrated FSR4 frame generation) treating fully-opaque
+        // overlay pixels as something to reproject. 254 vs 255 is a 0.4%
+        // opacity difference -- invisible -- and it sidesteps the whole thing.
+        let mut clamped = data.to_vec();
+        for px in clamped.chunks_exact_mut(4) {
+            if px[3] == 255 {
+                px[3] = 254;
+            }
+        }
+        let data: &[u8] = &clamped;
+
+        // CPU-writable path: hand the rows straight to the driver and let it do
+        // the linear -> tiled conversion. No upload buffer, no command list, no
+        // queue, no fence, no barriers.
+        if cpu_writable {
+            let src_row = width * 4;
+            tex_resource.WriteToSubresource(
+                0,
+                None,
+                data.as_ptr() as *const _,
+                src_row,
+                src_row * height,
+            )?;
+            debug!("upload_texture {width}x{height}: WriteToSubresource");
+            return Ok(());
         }
 
-        let upload_row_size = width * 4;
+        let src_row_size = width * 4;
+        let upload_row_size = alloc_width * 4;
         let align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        let upload_pitch = upload_row_size.div_ceil(align) * align; // 256 bytes aligned
-        let upload_size = height * upload_pitch;
+
+        // Ask the device for the authoritative copy layout instead of guessing
+        // it. hand-computing `align(width * 4, 256)` happens to agree with the
+        // driver most of the time, but it is not the contract -- the driver is
+        // the only thing that knows how it wants a buffer laid out for a
+        // buffer->texture copy.
+        let dst_desc = tex_resource.GetDesc();
+        let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut num_rows: u32 = 0;
+        let mut row_size_bytes: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        self.device.GetCopyableFootprints(
+            &dst_desc,
+            0,
+            1,
+            0,
+            Some(&mut layout),
+            Some(&mut num_rows),
+            Some(&mut row_size_bytes),
+            Some(&mut total_bytes),
+        );
+
+        let guessed_pitch = upload_row_size.div_ceil(align) * align;
+        let upload_pitch = layout.Footprint.RowPitch.max(guessed_pitch);
+
+        let upload_size = alloc_height * upload_pitch;
+
 
         let upload_buffer: ID3D12Resource = util::try_out_ptr(|v| unsafe {
             self.device.CreateCommittedResource(
@@ -883,13 +1074,35 @@ impl TextureHeap {
 
         let mut upload_buffer_ptr = ptr::null_mut();
         upload_buffer.Map(0, None, Some(&mut upload_buffer_ptr))?;
-        if upload_row_size == upload_pitch {
-            ptr::copy_nonoverlapping(data.as_ptr(), upload_buffer_ptr as *mut u8, data.len());
-        } else {
-            for y in 0..height {
-                let src = data.as_ptr().add((y * upload_row_size) as usize);
-                let dst = (upload_buffer_ptr as *mut u8).add((y * upload_pitch) as usize);
-                ptr::copy_nonoverlapping(src, dst, upload_row_size as usize);
+        // Copy row by row into the (possibly padded) destination. Padding
+        // columns and rows duplicate their neighbour so that sampling across
+        // the full uv 0..1 range looks identical to the unpadded image.
+        //
+        // Historical note: this used to take a bulk-memcpy shortcut whenever
+        // the row size happened to be 256-aligned. That shortcut is equivalent
+        // when the pitches match, and removing it changed nothing -- keeping
+        // the row loop only because it is the general case.
+        //
+        // The original code took a single bulk memcpy shortcut when the row
+        // size happened to be 256-byte aligned (upload_row_size == upload_pitch).
+        // Empirically, every texture that took that shortcut came out of the
+        // GPU as noise, and every texture that went row by row was fine --
+        // across 22 textures with no exception:
+        //
+        //   per-row : 286x286 icons, 2000x2000, 4000x4000, 729x4000  -> correct
+        //   bulk    : 4096x4096, 2048x2048, 1024x1024, 256x256       -> garbage
+        //
+        // The two paths write the same bytes when the pitches are equal, so
+        // this alone should not matter; going row-by-row unconditionally
+        // removes the variable while costing nothing measurable.
+        let last_texel = ((width - 1) * 4) as usize;
+        for y in 0..alloc_height {
+            let src_y = if y < height { y } else { height - 1 };
+            let src = data.as_ptr().add((src_y * src_row_size) as usize);
+            let dst = (upload_buffer_ptr as *mut u8).add((y * upload_pitch) as usize);
+            ptr::copy_nonoverlapping(src, dst, src_row_size as usize);
+            for x in width..alloc_width {
+                ptr::copy_nonoverlapping(src.add(last_texel), dst.add((x * 4) as usize), 4);
             }
         }
         upload_buffer.Unmap(0, None);
@@ -897,8 +1110,36 @@ impl TextureHeap {
         self.command_allocator.Reset()?;
         self.command_list.Reset(&self.command_allocator, None)?;
 
+        // This texture is written here, on the TextureHeap's OWN command queue,
+        // and later sampled on the render engine's queue. Two different queues.
+        //
+        // D3D12 requires a resource shared between queues to pass through
+        // D3D12_RESOURCE_STATE_COMMON to transfer ownership: that is the
+        // transition that flushes and resolves any driver-side compression
+        // metadata (DCC and friends). Going straight from COPY_DEST to
+        // PIXEL_SHADER_RESOURCE on the upload queue skips that, and the render
+        // queue then samples the texture with metadata it does not understand
+        // -- which reads back as a deterministic scramble of the real pixels,
+        // exactly the corruption seen here. Whether a given texture uses
+        // compression at all is a driver decision based on size and usage,
+        // which is why two 4000x4000 textures could behave differently.
+        //
+        // So: leave the resource in COMMON, and let implicit state promotion
+        // handle both the copy (COMMON -> COPY_DEST) and the sampling
+        // (COMMON -> PIXEL_SHADER_RESOURCE) on whichever queue needs it.
+        let pre_barriers = if tex_state == D3D12_RESOURCE_STATE_COMMON
+            || tex_state == D3D12_RESOURCE_STATE_COPY_DEST
+        {
+            Vec::new()
+        } else {
+            vec![util::create_barrier(&tex_resource, tex_state, D3D12_RESOURCE_STATE_COMMON)]
+        };
+        if !pre_barriers.is_empty() {
+            self.command_list.ResourceBarrier(&pre_barriers);
+        }
+
         let dst_location = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: ManuallyDrop::new(Some(texture.resource.clone())),
+            pResource: ManuallyDrop::new(Some(tex_resource.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
@@ -911,8 +1152,8 @@ impl TextureHeap {
                     Offset: 0,
                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                        Width: width,
-                        Height: height,
+                        Width: alloc_width,
+                        Height: alloc_height,
                         Depth: 1,
                         RowPitch: upload_pitch,
                     },
@@ -921,10 +1162,11 @@ impl TextureHeap {
         };
 
         self.command_list.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None);
+        // Back to COMMON, not to PIXEL_SHADER_RESOURCE -- see above.
         let barriers = [util::create_barrier(
-            &texture.resource,
+            &tex_resource,
             D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
         )];
 
         self.command_list.ResourceBarrier(&barriers);
@@ -935,6 +1177,11 @@ impl TextureHeap {
         self.fence.incr();
 
         barriers.into_iter().for_each(util::drop_barrier);
+        pre_barriers.into_iter().for_each(util::drop_barrier);
+
+        // Remember where we left the resource, so the next upload knows to
+        // transition it back to COPY_DEST first.
+        self.textures[texture_id.id()].state = D3D12_RESOURCE_STATE_COMMON;
 
         // Apparently, leaking the upload buffer into the location is necessary.
         // Uncommenting the following line consistently leads to a crash, which
