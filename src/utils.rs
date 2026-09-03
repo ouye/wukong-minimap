@@ -4,7 +4,8 @@
 // Fork:     https://github.com/Ouye/wukong-minimap
 //
 // Changes: image_with_file returns Option instead of panicking (it is now
-// called during gameplay); default log level lowered to info.
+// called during gameplay); default log level lowered to errors only, plus
+// this crate's startup banner.
 //
 // See CHANGES.md for the full record of what was changed and why.
 
@@ -65,10 +66,11 @@ pub fn setup_tracing() {
     // hudhook::alloc_console().unwrap();
     // hudhook::enable_console_colors();
     // dotenv::dotenv().ok();
-    // Release default. Set RUST_LOG=debug before launching the game to get the
-    // per-texture and per-frame chatter back.
+    // Release default: errors only, plus this crate's own startup banner, so
+    // that a log a user sends in is short enough to read and identifies the
+    // build. Set RUST_LOG=debug before launching the game for the full trace.
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
+        std::env::set_var("RUST_LOG", "error,wukong_minimap=info");
     }
 
     let log_file = hudhook::util::get_dll_path()

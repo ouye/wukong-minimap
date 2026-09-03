@@ -137,6 +137,12 @@ impl InitializationContext {
     }
 }
 
+/// Returned by `init_pipeline` while it is still waiting for both the swap
+/// chain hook and the command queue hook to have fired. Present is hooked
+/// first, so the frames in between have nothing to draw into yet; that is the
+/// normal startup sequence, not a failure.
+const E_NOT_READY: HRESULT = HRESULT(-2);
+
 static INITIALIZATION_CONTEXT: Mutex<InitializationContext> =
     Mutex::new(InitializationContext::Empty);
 static mut PIPELINE: OnceCell<Mutex<Pipeline<D3D12RenderEngine>>> = OnceCell::new();
@@ -144,8 +150,8 @@ static mut RENDER_LOOP: OnceCell<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceC
 
 unsafe fn init_pipeline() -> Result<Mutex<Pipeline<D3D12RenderEngine>>> {
     let Some((swap_chain, command_queue)) = ({ INITIALIZATION_CONTEXT.lock().get() }) else {
-        error!("Initialization context incomplete");
-        return Err(Error::from_hresult(HRESULT(-1)));
+        debug!("Initialization context incomplete, waiting for the command queue");
+        return Err(Error::from_hresult(E_NOT_READY));
     };
 
     let hwnd = util::try_out_param(|v| swap_chain.GetDesc(v)).map(|desc| desc.OutputWindow)?;
@@ -204,8 +210,12 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
 
     if let Err(e) = render(&swap_chain) {
-        util::print_dxgi_debug_messages();
-        error!("Render error: {e:?}");
+        if e.code() == E_NOT_READY {
+            debug!("Waiting for the initialization context");
+        } else {
+            util::print_dxgi_debug_messages();
+            error!("Render error: {e:?}");
+        }
     }
 
     trace!("Call IDXGISwapChain::Present trampoline");

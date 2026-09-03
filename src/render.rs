@@ -5,7 +5,11 @@
 //
 // Changes: maps are loaded on demand instead of all at once; the nomap
 // placeholder is resized to match the map textures; replace_texture
-// failures are logged; added the heading-up minimap mode (Shift+0).
+// failures are logged; added the heading-up minimap mode (Shift+0);
+// added a fork credit line beside upstream's logo on the big map.
+//
+// Upstream's own logo, baked into includes/mainwraper.png, is left exactly
+// as it is -- that asset is byte-identical to upstream.
 //
 // See CHANGES.md for the full record of what was changed and why.
 
@@ -19,7 +23,7 @@ use crate::{
 };
 use gilrs::{GamepadId, Gilrs};
 use hudhook::{
-    imgui::{self, Condition, Context, WindowFlags},
+    imgui::{self, Condition, Context, FontConfig, FontSource, WindowFlags},
     ImguiRenderLoop, RenderContext,
 };
 use hudhook::{
@@ -27,6 +31,24 @@ use hudhook::{
     tracing,
 };
 use image::{EncodableLayout, ImageFormat, RgbaImage};
+
+// 分支署名，画在大地图左下角、上游 logo 的右侧。
+//
+// mainwraper.png 整张被拉伸到边长 window_size 的正方形里，所以图中固定的
+// 像素坐标对应屏幕上固定的比例，与分辨率、宽高比无关。上游 logo 在 4000x4000
+// 原图里占 x 150..640、y 3695..3830，即 x 0.0375..0.1600、垂直中心 0.9407。
+//
+// 只能用 ASCII，内置字体没有中文字形。
+const FORK_CREDIT: &str = "1.0.20+ patch by Ouye@github";
+/// 文字左边缘，在 logo 右边缘 0.160 之后留出底色的间距
+const CREDIT_X: f32 = 0.183;
+/// 文字垂直中心，与 logo 对齐
+const CREDIT_Y: f32 = 0.9407;
+/// 文字高度占 window_size 的比例，约为 logo 高度 0.0338 的六成
+const CREDIT_PX: f32 = 0.018;
+/// 字体图集的光栅化尺寸。内置 ProggyClean 只有 13px，4K 下需要放大近三倍；
+/// 按 32px 烘焙、绘制时再缩小。
+const CREDIT_FONT_PX: f32 = 32.0;
 
 #[derive(Clone, Debug)]
 pub struct MapView {
@@ -440,10 +462,36 @@ impl MiniMap {
                             [window_offset_x + window_size, window_offset_y + window_size],
                         )
                         .build();
+
+                    // 分支署名，坐标见文件顶部的 CREDIT_* 常量
+                    let credit_px = window_size * CREDIT_PX;
+                    ui.set_window_font_scale(credit_px / CREDIT_FONT_PX);
+                    let text_size = ui.calc_text_size(FORK_CREDIT);
+                    let text_pos = [
+                        window_offset_x + window_size * CREDIT_X,
+                        window_offset_y + window_size * CREDIT_Y - text_size[1] / 2.0,
+                    ];
+                    let pad_x = credit_px * 0.55;
+                    let pad_y = credit_px * 0.28;
+                    draw_list
+                        .add_rect(
+                            [text_pos[0] - pad_x, text_pos[1] - pad_y],
+                            [
+                                text_pos[0] + text_size[0] + pad_x,
+                                text_pos[1] + text_size[1] + pad_y,
+                            ],
+                            [0.0, 0.0, 0.0, 0.55],
+                        )
+                        .filled(true)
+                        .rounding((text_size[1] + pad_y * 2.0) / 2.0)
+                        .build();
+                    draw_list.add_text(text_pos, [1.0, 1.0, 1.0, 0.85], FORK_CREDIT);
+                    ui.set_window_font_scale(1.0);
+
                     ui.set_cursor_pos([40.0, map_size - 40.0]);
                     // ui.text(format!("{:?}", self.game));
                 } else {
-                    tracing::info!("draw_nomap");
+                    tracing::debug!("draw_nomap");
                 }
             });
 
@@ -669,31 +717,31 @@ impl MiniMap {
                         )
                         .build();
                 } else {
-                    tracing::info!("draw_nomap");
+                    tracing::debug!("draw_nomap");
                 }
             });
     }
     fn render(&mut self, ui: &imgui::Ui) {
         if ui.is_key_pressed_no_repeat(Key::Minus) && !ui.is_key_down(Key::LeftShift) {
             self.size = (self.size - 0.05).max(0.15);
-            tracing::info!("size: {}", self.size);
+            tracing::debug!("size: {}", self.size);
         }
         if ui.is_key_pressed_no_repeat(Key::Equal) && !ui.is_key_down(Key::LeftShift) {
             self.size = (self.size + 0.05).min(0.5);
-            tracing::info!("size: {}", self.size);
+            tracing::debug!("size: {}", self.size);
         }
         if ui.is_key_pressed_no_repeat(Key::Minus) && ui.is_key_down(Key::LeftShift) {
             self.zoom = (self.zoom - 0.05).max(0.15);
-            tracing::info!("zoom: {}", self.zoom);
+            tracing::debug!("zoom: {}", self.zoom);
         }
         if ui.is_key_pressed_no_repeat(Key::Equal) && ui.is_key_down(Key::LeftShift) {
             self.zoom = (self.zoom + 0.05).min(0.5);
-            tracing::info!("zoom: {}", self.zoom);
+            tracing::debug!("zoom: {}", self.zoom);
         }
         if ui.is_key_pressed_no_repeat(Key::Alpha0) {
             if ui.is_key_down(Key::LeftShift) {
                 self.rotate_map = !self.rotate_map;
-                tracing::info!("rotate_map: {}", self.rotate_map);
+                tracing::debug!("rotate_map: {}", self.rotate_map);
             } else {
                 self.is_show = !self.is_show;
             }
@@ -706,7 +754,7 @@ impl MiniMap {
             // Examine new events
             while let Some(gilrs::Event { id, event, .. }) = gilrs.next_event() {
                 self.current_gamepad = Some(id);
-                tracing::info!("gilrs event from {}: {:?}", id, event);
+                tracing::debug!("gilrs event from {}: {:?}", id, event);
                 if let gilrs::EventType::ButtonPressed(button, code) = event {
                     let gamepad = gilrs.gamepad(id);
                     if gamepad.is_pressed(gilrs::Button::RightTrigger) {
@@ -714,7 +762,7 @@ impl MiniMap {
                             gilrs::Button::DPadDown => {
                                 self.is_show_main = !self.is_show_main;
                                 // wukong::toggle_mouse_cursor(self.is_show_main);
-                                tracing::info!("Button West is pressed");
+                                tracing::debug!("gamepad: toggle main map");
                             }
                             _ => {}
                         }
@@ -738,6 +786,15 @@ impl ImguiRenderLoop for MiniMap {
     fn initialize<'a>(&'a mut self, ctx: &mut Context, render_context: &'a mut dyn RenderContext) {
         let io = ctx.io_mut();
         io.mouse_draw_cursor = false;
+        // 按 CREDIT_FONT_PX 光栅化内置字体。不加这段时 imgui 会自己建一个
+        // 13px 的字体图集，署名在高分辨率下需要放大，糊得明显。
+        ctx.fonts().add_font(&[FontSource::DefaultFontData {
+            config: Some(FontConfig {
+                size_pixels: CREDIT_FONT_PX,
+                ..FontConfig::default()
+            }),
+        }]);
+
         let style = ctx.style_mut();
         style.window_rounding = 10.0;
         style.window_padding = [0.0, 0.0];
@@ -792,7 +849,7 @@ impl ImguiRenderLoop for MiniMap {
     ) {
         let map = self.update_map();
         if let Some(map) = map {
-            tracing::info!("update map: {} at {:?}", map.key, (self.game.x, self.game.y));
+            tracing::debug!("update map: {} at {:?}", map.key, (self.game.x, self.game.y));
 
             // Load on demand and keep only the current map resident.
             if !self.map_images.contains_key(map.key.as_str()) {

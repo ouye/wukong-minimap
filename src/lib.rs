@@ -1,3 +1,13 @@
+// This file was modified in a fork of jaskang/wukong-minimap.
+//
+// Upstream: https://github.com/jaskang/wukong-minimap (Apache-2.0)
+// Fork:     https://github.com/Ouye/wukong-minimap
+//
+// Changes: log the build version and both repository URLs at startup, so a
+// user-submitted log file identifies which build produced it.
+//
+// See CHANGES.md for the full record of what was changed and why.
+
 use std::fs::File;
 use std::{ffi, panic, thread, time};
 
@@ -18,6 +28,11 @@ pub extern "stdcall" fn DllMain(hmodule: HINSTANCE, reason: u32, _: *mut ffi::c_
         setup_tracing();
 
         tracing::info!("DllMain: DLL_PROCESS_ATTACH");
+        // 版本与出处，用于识别用户反馈的日志来自哪个构建
+        tracing::info!(
+            "wukong-minimap {} | fork: github.com/Ouye/wukong-minimap | upstream: github.com/jaskang/wukong-minimap (Apache-2.0)",
+            env!("CARGO_PKG_VERSION")
+        );
 
         // 设置panic钩子
         panic::set_hook(Box::new(|panic_info| {

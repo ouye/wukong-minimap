@@ -97,6 +97,12 @@ vendored 副本，四处改动。**前三处是与本项目无关的通用 bug�
 
    同时改用 `WriteToSubresource` + CUSTOM 堆作为纹理上传主路径（保留原路径作为回退）。
 
+5. **`hooks/dx12.rs` — 启动竞态被记为 error**
+
+   `Present` 比 `ExecuteCommandLists` 先被挂上，两者都就绪之前 `init_pipeline`
+   无法建立管线。这是正常的启动顺序，但原代码对每一帧都打两条 `error!`。
+   改为返回一个专用的 `E_NOT_READY`，该分支降为 `debug!`，其余错误照旧上报。
+
 ### 插件本体（`src/`）
 
 - **地图按需加载**：原本启动时解码全部 23 张地图并常驻内存。改为只保留当前所在区域，
@@ -105,7 +111,13 @@ vendored 副本，四处改动。**前三处是与本项目无关的通用 bug�
   不应导致游戏崩溃）
 - `replace_texture` 的失败不再被 `let _ =` 吞掉
 - 占位图 `nomap.webp` 缩放至 2000×2000 与地图尺寸一致（`replace_texture` 拒绝尺寸变化）
-- 日志默认级别 `debug` → `info`，可用 `RUST_LOG` 覆盖
+- 每帧、每个手柄事件的 `info!` 降为 `debug!`（`draw_nomap`、`gilrs event` 会在
+  一次游戏过程中写出数 MB 日志）
+- 日志默认级别改为 `error,wukong_minimap=info`：只保留错误和本插件的启动横幅，
+  可用 `RUST_LOG=debug` 取回完整输出
+- 启动时记录版本与仓库地址，便于确认用户反馈的日志来自哪个构建
+- 大地图左下角、上游 logo 右侧增加一行分支署名。`includes/mainwraper.png`
+  与上游逐字节一致，未做覆盖或改动
 
 ### 新功能：地图朝向模式（`Shift` + `0`）
 
