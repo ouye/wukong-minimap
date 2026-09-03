@@ -1,65 +1,124 @@
-# Black Myth: Wukong - Built-in Real-time Map
+# Black Myth: Wukong - Built-in Real-time Map (1.0.20+ branch)
 
 ![alt text](./docs/banner.png)
 
-A minimap plugin for Black Myth: Wukong that provides real-time location tracking and navigation features. It's free~free~free~
+> **This is a fork of [jaskang/wukong-minimap](https://github.com/jaskang/wukong-minimap).**
+>
+> All of the core work — the injection, the rendering, the coordinate math, and the several
+> hundred hand-collected map points — is [@jaskang](https://github.com/jaskang)'s.
+> **Please go star the original repository first.**
+>
+> This branch does one thing: **make it work again on game versions after the
+> 1.0.20 update of October 2025**, plus one optional heading-up map mode.
+> The minimap's gameplay and visual design are untouched.
+>
+> The full record of what changed is in [CHANGES.md](./CHANGES.md).
 
-- Download: [releases](https://github.com/jaskang/wukong-minimap/releases)
-- BiliBli Demo Video：[程序员自费开发黑神话小地图，精准还原行旅图～](https://www.bilibili.com/video/BV1Y1KueREho/?share_source=copy_web&vd_source=dcfc3e9cca2640bbaa21c24979c4c34b)
-- GitHub: [Please help me click star](https://github.com/jaskang/wukong-minimap)
-- Nexusmods: [Don't forget to recommend it](https://www.nexusmods.com/blackmythwukong/mods/1172)
+- Download: [releases](https://github.com/Ouye/wukong-minimap/releases)
+- Original project: [jaskang/wukong-minimap](https://github.com/jaskang/wukong-minimap) · [BiliBili demo video](https://www.bilibili.com/video/BV1Y1KueREho/) · [Nexusmods](https://www.nexusmods.com/blackmythwukong/mods/1172)
 
-切换语言: [中文](README.md)
+Switch language: [中文](README.md)
+
+## What this branch changes
+
+The 1.0.20 game update (2025-10-13) triggered two **independent** failures:
+
+**1. The plugin did not work at all.** Relinking the executable invalidated every SDK
+offset. The SDK has been regenerated, and the global addresses are now resolved by
+**runtime signature scanning** instead of being baked in at compile time, which should
+survive future minor game updates much better.
+
+**2. The minimap texture rendered as garbage.** This one has nothing to do with the
+plugin's own code — the new game build's D3D12 environment exposed a long-standing
+problem in the rendering library. A two-way controlled experiment pinned the trigger
+down to **the texture being fully opaque (alpha == 255)**, and it is now worked around.
+
+Along the way: three general bugs fixed in the rendering library, resident memory cut
+from 368 MB to 16 MB, and the install package from 96 MB to 23 MB.
 
 ## Changelog
 
-- v1.7
-  - 调整 UI
-  - 添加大量点位
-- v1.6
-  - Fixed AMD GPU rendering issues
-  - Added map points
+- v1.9 (this fork)
+  - Works on game versions after 1.0.20
+  - Fixed the garbled minimap texture
+  - New heading-up map mode: `Shift` + `0`
+  - Maps are loaded on demand: 368 MB → 16 MB resident
+  - Maps resampled to 2000×2000: 96 MB → 23 MB install size
+- v1.7 (upstream)
+  - UI adjustments, many map points added
+- v1.6 (upstream)
+  - Fixed AMD GPU rendering issues, added map points
 
-## 按键说明：
+## Key bindings
 
 - `+` Zoom in the minimap window
-- `-` Zoom out the mini-map window
-- `Shift` + `+` Zoom in the mini-map scale
-- `Shift` + `-` Zoom out the mini-map scale
-- `0` Show/Hide the map
+- `-` Zoom out the minimap window
+- `Shift` + `+` Zoom in the minimap scale
+- `Shift` + `-` Zoom out the minimap scale
+- `0` Show / hide the map
+- `Shift` + `0` Toggle the map orientation mode **(new in this fork)**
+  - Default: the map is fixed, the arrow turns with the character
+  - Toggled: the arrow is locked pointing up, the map turns with the character
 
-## Demo Screenshots
+## Demo screenshots
 
 ![alt text](./docs/demo0.png)
 ![alt text](./docs/demo1.png)
 ![alt text](./docs/demo2.png)
 
-## Installation Instructions
+## Installation
 
-Extract `wukong-minimap.zip` directly to the `b1\Binaries\Win64` folder under Black Myth's installation directory (Steam installation folder can be found by right-clicking Black Myth -> Manage -> Browse Local Files)
+Extract `wukong-minimap.zip` directly into the `b1\Binaries\Win64` folder under Black
+Myth's installation directory (for Steam, right-click Black Myth -> Manage -> Browse
+Local Files).
 
 ![alt text](./docs/install0.png)
 
 This plugin includes the following files:
 
-- `wukong_minimap.dll` Core plugin functionality file
-- `dwmapi.dll` Loader - Loads wukong_minimap.dll by proxying system functions
-- `maps` Map folder
+- `wukong_minimap.dll` — the plugin itself
+- `dwmapi.dll` — the loader; proxies the system DLL to load `wukong_minimap.dll`
+- `maps` — the map folder
 
-If you have other means to load `wukong_minimap.dll`, you can completely skip `dwmapi.dll`
+If you have another way to load `wukong_minimap.dll`, you can skip `dwmapi.dll` entirely.
 
-## For UE4SS Users
+## For UE4SS users
 
-Since ue4ss's built-in `dwmapi.dll` intercepts system APIs which prevents the plugin from loading properly, we just use the dwmapi.dll from wukong-minimap.
+UE4SS ships its own `dwmapi.dll` which intercepts the same system APIs and stops the
+plugin from loading. Use the `dwmapi.dll` from wukong-minimap instead.
 
 ## Uninstallation
 
-Simply delete the `wukong_minimap.dll` file.
+Delete `wukong_minimap.dll`.
 
-## WeChat Group
+## Building from source
 
-<div align="center">
+You need Windows + MSVC (with the C++ toolset) + CMake + Rust (`x86_64-pc-windows-msvc`).
 
-![alt text](./docs/wechat.png)
+```powershell
+# build, install into the game folder, and package
+.\build.ps1 -Package -Install "D:\Games\Steam\steamapps\common\BlackMythWukong\b1\Binaries\Win64"
+```
 
-</div>
+`check_offsets.ps1` checks whether the signatures still match the current executable
+without launching the game — **run this first if the plugin breaks after a game
+update**. It will tell you whether a rebuild is enough or the SDK has to be dumped again.
+
+## Troubleshooting
+
+The plugin writes `wukong_minimap.log` next to the dll. For verbose output, set
+`RUST_LOG=debug` before launching the game. Please attach that file when reporting a
+problem.
+
+## Licence and credits
+
+This project inherits upstream's **Apache License 2.0**. The original copyright belongs
+to [@jaskang](https://github.com/jaskang).
+
+- [jaskang/wukong-minimap](https://github.com/jaskang/wukong-minimap) — the original project (Apache-2.0)
+- [hudhook](https://github.com/veeenu/hudhook) — injection and rendering framework (MIT, Andrea Venuta); a modified vendored copy is included in this repository
+- [imgui](https://github.com/ocornut/imgui)
+- [Dumper-7](https://github.com/Encryqed/Dumper-7) — generates the UE SDK
+
+The map assets under `maps/` come from the upstream repository; this fork only
+resampled them.
