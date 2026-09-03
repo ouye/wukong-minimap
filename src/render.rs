@@ -5,7 +5,7 @@
 //
 // Changes: maps are loaded on demand instead of all at once; the nomap
 // placeholder is resized to match the map textures; replace_texture
-// failures are logged.
+// failures are logged; added the heading-up minimap mode (Shift+0).
 //
 // See CHANGES.md for the full record of what was changed and why.
 
@@ -113,6 +113,9 @@ pub struct MiniMap {
     game: GameState,
     is_show_main: bool,
     is_show: bool,
+    /// Heading-up mode: the arrow stays pointing up and the map turns under it.
+    /// Off (the default) is north-up: the map is fixed and the arrow turns.
+    rotate_map: bool,
 }
 
 impl MiniMap {
@@ -176,6 +179,7 @@ impl MiniMap {
             game: wukong::game_state(),
             is_show_main: false,
             is_show: true,
+            rotate_map: false,
         }
     }
 
@@ -506,17 +510,80 @@ impl MiniMap {
                         map_size,
                     );
 
-                    let (uv_min, uv_max) = self.get_map_uv(map, &map_view);
-                    draw_list
-                        .add_image_rounded(
-                            map_image,
-                            [map_offset_x, map_offset_y],
-                            [map_offset_x + map_size, map_offset_y + map_size],
-                            map_size / 2.0,
-                        )
-                        .uv_min(uv_min)
-                        .uv_max(uv_max)
-                        .build();
+                    // Quantities the heading-up path needs. `scale_px` is
+                    // pixels per world unit; `rot_*` rotate between screen and
+                    // world space.
+                    let center_px = Pos2::new(
+                        map_offset_x + map_size / 2.0,
+                        map_offset_y + map_size / 2.0,
+                    );
+                    let player = Pos2::new(self.game.x, self.game.y);
+                    let [x_start, y_start, _] = map.range.start;
+                    let [x_end, y_end, _] = map.range.end;
+                    let full_w = (x_end - x_start).abs();
+                    let full_h = (y_end - y_start).abs();
+                    let scale_px = map_size / (full_w * self.zoom);
+                    let (rot_sin, rot_cos) = self.game.angle.to_radians().sin_cos();
+
+                    if self.rotate_map {
+                        // Heading-up. The screen quad stays put and the sampled
+                        // region turns instead, so the minimap keeps its round
+                        // shape: a triangle fan out of degenerate image quads,
+                        // with each vertex's uv computed individually.
+                        //
+                        // A screen offset d maps to the world offset
+                        // R(angle) * d / scale, which is the inverse of the
+                        // rotation applied to the arrow in north-up mode.
+                        //
+                        // uvs are clamped because hudhook's sampler is set to
+                        // WRAP -- without this the far edge of the map bleeds in
+                        // once the player gets near a border.
+                        let to_uv = |dx: f32, dy: f32| {
+                            let wx = (dx * rot_cos - dy * rot_sin) / scale_px;
+                            let wy = (dx * rot_sin + dy * rot_cos) / scale_px;
+                            [
+                                ((player.x + wx - x_start) / full_w).clamp(0.0, 1.0),
+                                ((player.y + wy - y_start) / full_h).clamp(0.0, 1.0),
+                            ]
+                        };
+
+                        const SEGMENTS: usize = 72;
+                        let radius = map_size / 2.0;
+                        let uv_center = to_uv(0.0, 0.0);
+                        let step = std::f32::consts::TAU / SEGMENTS as f32;
+                        for i in 0..SEGMENTS {
+                            let (s0, c0) = (i as f32 * step).sin_cos();
+                            let (s1, c1) = ((i + 1) as f32 * step).sin_cos();
+                            let (d0x, d0y) = (c0 * radius, s0 * radius);
+                            let (d1x, d1y) = (c1 * radius, s1 * radius);
+                            let a = [center_px.x + d0x, center_px.y + d0y];
+                            let b = [center_px.x + d1x, center_px.y + d1y];
+                            let uv_a = to_uv(d0x, d0y);
+                            let uv_b = to_uv(d1x, d1y);
+                            draw_list
+                                .add_image_quad(
+                                    map_image,
+                                    [center_px.x, center_px.y],
+                                    a,
+                                    b,
+                                    b,
+                                )
+                                .uv(uv_center, uv_a, uv_b, uv_b)
+                                .build();
+                        }
+                    } else {
+                        let (uv_min, uv_max) = self.get_map_uv(map, &map_view);
+                        draw_list
+                            .add_image_rounded(
+                                map_image,
+                                [map_offset_x, map_offset_y],
+                                [map_offset_x + map_size, map_offset_y + map_size],
+                                map_size / 2.0,
+                            )
+                            .uv_min(uv_min)
+                            .uv_max(uv_max)
+                            .build();
+                    }
 
                     // 绘制地图图标
                     self.points
@@ -548,11 +615,21 @@ impl MiniMap {
                                 let center_offset_x = map_offset_x + map_size / 2.0;
                                 let center_offset_y = map_offset_y + map_size / 2.0;
 
-                                let icon_offset = self.get_icon_offset(
-                                    Pos2::new(point.x, point.y),
-                                    [map_offset_x, map_offset_y],
-                                    &map_view,
-                                );
+                                let icon_offset = if self.rotate_map {
+                                    // World offset -> R(-angle) -> screen.
+                                    let wx = (point.x - player.x) * scale_px;
+                                    let wy = (point.y - player.y) * scale_px;
+                                    Pos2::new(
+                                        center_px.x + wx * rot_cos + wy * rot_sin,
+                                        center_px.y - wx * rot_sin + wy * rot_cos,
+                                    )
+                                } else {
+                                    self.get_icon_offset(
+                                        Pos2::new(point.x, point.y),
+                                        [map_offset_x, map_offset_y],
+                                        &map_view,
+                                    )
+                                };
                                 // 判断是否在可视区域内, icon_pos 和 center 之间的距离小于 map_size / 2 - icon_size_half
                                 let distance = ((icon_offset.x - center_offset_x).powi(2)
                                     + (icon_offset.y - center_offset_y).powi(2))
@@ -575,9 +652,10 @@ impl MiniMap {
                             }
                         });
 
-                    // 绘制玩家角色箭头
+                    // 绘制玩家角色箭头（旋转模式下箭头锁定，由地图转）
+                    let arrow_angle = if self.rotate_map { 0.0 } else { self.game.angle };
                     let [p0, p1, p2, p3] =
-                        self.p4_with_angle(center, self.game.angle, icon_size * 1.5);
+                        self.p4_with_angle(center, arrow_angle, icon_size * 1.5);
                     draw_list
                         .add_image_quad(self.textures.mapplayer.id.unwrap(), p0, p1, p2, p3)
                         .build();
@@ -613,7 +691,12 @@ impl MiniMap {
             tracing::info!("zoom: {}", self.zoom);
         }
         if ui.is_key_pressed_no_repeat(Key::Alpha0) {
-            self.is_show = !self.is_show;
+            if ui.is_key_down(Key::LeftShift) {
+                self.rotate_map = !self.rotate_map;
+                tracing::info!("rotate_map: {}", self.rotate_map);
+            } else {
+                self.is_show = !self.is_show;
+            }
         }
         if ui.is_key_pressed_no_repeat(Key::Tab) {
             self.is_show_main = !self.is_show_main;
