@@ -1,3 +1,15 @@
+// This file was modified in a fork of jaskang/wukong-minimap.
+//
+// Upstream: https://github.com/jaskang/wukong-minimap (Apache-2.0)
+// Fork:     https://github.com/Ouye/wukong-minimap
+//
+// Vendored from veeenu/hudhook 0.8.2 (MIT), then modified.
+//
+// Changes: Fence starts at 1, not 0 -- with 0 the first Signal/wait pair on
+// every fence was a no-op and the first GPU submission was never waited for.
+//
+// See CHANGES.md for the full record of what was changed and why.
+
 //! General-purpose utilities. These are used across the [`crate`] but have
 //! proven useful in client code as well.
 
@@ -252,7 +264,13 @@ impl Fence {
     /// Construct the fence.
     pub fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
         let fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
-        let value = AtomicU64::new(0);
+        // Start at 1, not 0. Every call site does
+        //     queue.Signal(fence, fence.value()); fence.wait(); fence.incr();
+        // and `wait()` only blocks while `GetCompletedValue() < value`. With a
+        // starting value of 0 the very first Signal/wait pair is a no-op --
+        // the fence is already at 0 -- so the first GPU submission on each
+        // fence is never actually waited for.
+        let value = AtomicU64::new(1);
         let event = unsafe { CreateEventExW(None, None, CREATE_EVENT(0), 0x1f0003) }?;
 
         Ok(Fence { fence, value, event })
