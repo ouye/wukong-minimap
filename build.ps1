@@ -135,6 +135,25 @@ if (-not (Test-Path $sdkTree)) {
 }
 if ($Clean -and (Test-Path $sdkBuild)) { Remove-Item -Recurse -Force $sdkBuild }
 
+# CMake bakes absolute paths into CMakeCache.txt, so a build directory that was
+# moved or copied to another path refuses to configure again. Detect that and
+# start fresh instead of making the user work out which directory to delete.
+$cacheFile = Join-Path $sdkBuild 'CMakeCache.txt'
+if (Test-Path $cacheFile) {
+    $line = Select-String -Path $cacheFile -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=' |
+            Select-Object -First 1
+    $cachedHome = ''
+    if ($line) { $cachedHome = ($line.Line -split '=', 2)[1] }
+    $want = (Resolve-Path $sdkSrc).Path.TrimEnd('\')
+    $have = $cachedHome.Replace('/', '\').TrimEnd('\')
+    if ($have -and ($have -ne $want)) {
+        Step "b1sdk\build was configured for a different path - clearing it"
+        Info "cached  : $have"
+        Info "current : $want"
+        Remove-Item -Recurse -Force $sdkBuild
+    }
+}
+
 Step "configuring b1sdk"
 $cmArgs = @('-S', $sdkSrc, '-B', $sdkBuild, '-G', $Generator, '-A', 'x64')
 if ($Full)    { $cmArgs += '-DB1SDK_FULL=ON' }

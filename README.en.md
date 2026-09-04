@@ -9,8 +9,9 @@
 > **Please go star the original repository first.**
 >
 > This branch does one thing: **make it work again on game versions after the
-> 1.0.20 update of October 2025**, plus one optional heading-up map mode.
-> The minimap's gameplay and visual design are untouched.
+> 1.0.20 update of October 2025**, plus two optional extras: a heading-up map
+> mode and a record of where you have walked. The minimap's gameplay and visual
+> design are untouched.
 >
 > The full record of what changed is in [CHANGES.md](./CHANGES.md).
 
@@ -33,15 +34,23 @@ plugin's own code — the new game build's D3D12 environment exposed a long-stan
 problem in the rendering library. A two-way controlled experiment pinned the trigger
 down to **the texture being fully opaque (alpha == 255)**, and it is now worked around.
 
-Along the way: three general bugs fixed in the rendering library, resident memory cut
+The trail of where you have walked is also recorded now, per map area, and drawn on
+both the minimap and the big map.
+
+Along the way: four general bugs fixed in the rendering library, resident memory cut
 from 368 MB to 16 MB, and the install package from 96 MB to 23 MB.
 
 ## Changelog
 
-- v1.9 (this fork)
+- v2.0 (this fork)
   - Works on game versions after 1.0.20
   - Fixed the garbled minimap texture
   - New heading-up map mode: `Shift` + `0`
+  - The walked trail is now recorded and drawn: `9` / `Shift` + `9`
+  - Settings (window size, scale, orientation, trail) persist across restarts
+  - The trail colour can be set in the config file
+  - On-screen messages use a Chinese system font when one is available
+  - The key bindings are listed alongside the big map
   - Maps are loaded on demand: 368 MB → 16 MB resident
   - Maps resampled to 2000×2000: 96 MB → 23 MB install size
 - v1.7 (upstream)
@@ -51,6 +60,9 @@ from 368 MB to 16 MB, and the install package from 96 MB to 23 MB.
 
 ## Key bindings
 
+Press `Tab` to open the big map and the same list appears down its right-hand side,
+so you do not have to come back here for it.
+
 - `+` Zoom in the minimap window
 - `-` Zoom out the minimap window
 - `Shift` + `+` Zoom in the minimap scale
@@ -59,6 +71,26 @@ from 368 MB to 16 MB, and the install package from 96 MB to 23 MB.
 - `Shift` + `0` Toggle the map orientation mode **(new in this fork)**
   - Default: the map is fixed, the arrow turns with the character
   - Toggled: the arrow is locked pointing up, the map turns with the character
+- `9` Toggle the walked trail **(new in this fork)** — off means neither drawn nor recorded
+- `Shift` + `9` Clear the whole trail **(new in this fork)** — not undoable; press a second time within 3 seconds to confirm
+
+These settings — window size, scale, orientation and the trail toggle — are kept in
+`wukong_minimap_config.json` next to the dll and restored on the next launch. Delete
+that file to go back to the defaults.
+
+That file also holds the trail colour, which is edit-by-hand only:
+
+```json
+"trail_color": "#22E0FFCC"
+```
+
+`#RRGGBB` or `#RRGGBBAA` (the last two digits are opacity). Restart the game to apply.
+A malformed value falls back to the built-in cyan and says so in the log.
+
+The trail is recorded per map area and kept in `wukong_minimap_trails.json` next
+to the dll, reloaded on the next launch. Copy that file to back it up, delete it
+to wipe the trail by hand. It is written every 30 seconds and whenever you change
+area, so a crash costs at most the last 30 seconds of trail.
 
 ## Demo screenshots
 

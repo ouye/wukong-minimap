@@ -16,7 +16,10 @@ use hudhook::tracing;
 use hudhook::windows::Win32::{Foundation::HINSTANCE, System::SystemServices::DLL_PROCESS_ATTACH};
 use utils::{get_dll_dir, setup_tracing};
 
+mod config;
+mod font;
 mod render;
+mod trail;
 mod utils;
 mod wukong;
 

@@ -5,25 +5,31 @@
 //
 // Changes: maps are loaded on demand instead of all at once; the nomap
 // placeholder is resized to match the map textures; replace_texture
-// failures are logged; added the heading-up minimap mode (Shift+0);
-// added a fork credit line beside upstream's logo on the big map.
+// failures are logged; added the heading-up minimap mode (Shift+0), the
+// walked trail (9 / Shift+9), persisted settings, on-screen messages in
+// Chinese where a system font provides it, and a fork credit line beside
+// upstream's logo on the big map.
 //
 // Upstream's own logo, baked into includes/mainwraper.png, is left exactly
 // as it is -- that asset is byte-identical to upstream.
 //
 // See CHANGES.md for the full record of what was changed and why.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Instant};
 
 use crate::{
+    config::Config,
+    font,
+    trail::{clip_polyline_to_circle, Trail},
     utils::{
-        image_with_bytes, image_with_file, is_in_map, load_data, load_points, MapInfo, Point, Pos2,
+        get_dll_dir, image_with_bytes, image_with_file, is_in_map, load_data, load_points, MapInfo,
+        Point, Pos2,
     },
     wukong::{self, GameState},
 };
 use gilrs::{GamepadId, Gilrs};
 use hudhook::{
-    imgui::{self, Condition, Context, FontConfig, FontSource, WindowFlags},
+    imgui::{self, Condition, Context, FontConfig, FontGlyphRanges, FontSource, WindowFlags},
     ImguiRenderLoop, RenderContext,
 };
 use hudhook::{
@@ -48,7 +54,44 @@ const CREDIT_Y: f32 = 0.9407;
 const CREDIT_PX: f32 = 0.018;
 /// 字体图集的光栅化尺寸。内置 ProggyClean 只有 13px，4K 下需要放大近三倍；
 /// 按 32px 烘焙、绘制时再缩小。
-const CREDIT_FONT_PX: f32 = 32.0;
+const FONT_ATLAS_PX: f32 = 32.0;
+
+// ------------------------------------------------------------------ 路径 ---
+
+/// 线宽占 window_size 的比例，下限保证低分辨率下不至于细到看不见。
+const TRAIL_WIDTH: f32 = 0.0035;
+/// 提示条停留时长。
+const TOAST_SECS: f32 = 3.0;
+/// `Shift`+`9` 二次确认的时限。
+const CLEAR_CONFIRM_SECS: f32 = 3.0;
+
+/// 配置落盘的节流间隔。连按 `+`/`-` 时不必每一下都写盘。
+const CONFIG_SAVE_DELAY: f32 = 2.0;
+
+// 提示条文案。找得到系统中文字体就用中文，否则回退到英文（内置字体只有 ASCII）。
+// 这里列出的中文字符决定了要烘焙进字体图集的字形集合，见 `font::glyph_ranges_for`。
+const MSG_TRAIL_ON: (&str, &str) = ("路线记录：开", "Trail ON");
+const MSG_TRAIL_OFF: (&str, &str) = ("路线记录：关", "Trail OFF");
+const MSG_TRAIL_CONFIRM: (&str, &str) = (
+    "再按一次 Shift+9 清除全部路线",
+    "Press Shift+9 again to clear the trail",
+);
+const MSG_TRAIL_CLEARED: (&str, &str) = ("路线已清除", "Trail cleared");
+const MSG_HEADING_UP: (&str, &str) = ("地图朝向：跟随人物", "Map: heading up");
+const MSG_NORTH_UP: (&str, &str) = ("地图朝向：正北朝上", "Map: north up");
+const MSG_POINTS: (&str, &str) = ("个点", "points");
+
+/// 大地图右侧那一列按键说明。左键名是 ASCII，右边的说明跟着字体走。
+const HELP_TITLE: (&str, &str) = ("按键说明", "Controls");
+const HELP_ROWS: &[(&str, (&str, &str))] = &[
+    ("Tab", ("大地图", "Big map")),
+    ("0", ("显示 / 隐藏小地图", "Show / hide")),
+    ("+ / -", ("小地图窗口大小", "Window size")),
+    ("Shift  +/-", ("地图缩放比例", "Map scale")),
+    ("Shift  0", ("地图朝向模式", "Map orientation")),
+    ("9", ("路线记录开关", "Trail on / off")),
+    ("Shift  9", ("清除全部路线", "Clear the trail")),
+];
 
 #[derive(Clone, Debug)]
 pub struct MapView {
@@ -138,6 +181,21 @@ pub struct MiniMap {
     /// Heading-up mode: the arrow stays pointing up and the map turns under it.
     /// Off (the default) is north-up: the map is fixed and the arrow turns.
     rotate_map: bool,
+    /// 走过的路线。始终常驻，由 `trail_enabled` 决定记不记、画不画。
+    trail: Trail,
+    trail_enabled: bool,
+    /// `Shift`+`9` 按下的时刻。清除是不可逆的，所以要在时限内按第二次。
+    trail_clear_armed: Option<Instant>,
+    /// 屏幕提示。
+    toast: Option<(String, Instant)>,
+    /// 字体图集里有中文字形。没有的话提示条回退成英文。
+    cjk: bool,
+    /// 路线颜色。启动时从配置解析一次，`config.trail_color` 是它的来源。
+    trail_color: [f32; 4],
+    /// 上次落盘的设置，用来判断有没有改动。
+    config: Config,
+    config_path: PathBuf,
+    config_saved_at: Instant,
 }
 
 impl MiniMap {
@@ -187,21 +245,36 @@ impl MiniMap {
         // resident memory for images the player is not looking at.
         let map_images: HashMap<String, RgbaImage> = HashMap::new();
 
+        let dll_dir = get_dll_dir();
+        let config = Config::load(&dll_dir);
+        // 把补全过的配置写回去，文件里就总是带着全部字段和它们当前的值，
+        // 用户打开就知道有哪些能改。
+        config.save(&Config::path(&dll_dir));
+
         let gilrs = Gilrs::new().unwrap();
         Self {
             gilrs: Mutex::new(gilrs),
             current_gamepad: None,
             textures,
             map_images,
-            zoom: 0.2,
-            size: 0.25,
+            zoom: config.zoom,
+            size: config.size,
             map: None,
             maps,
             points,
             game: wukong::game_state(),
             is_show_main: false,
             is_show: true,
-            rotate_map: false,
+            rotate_map: config.rotate_map,
+            trail: Trail::load(&dll_dir),
+            trail_enabled: config.trail_enabled,
+            trail_clear_armed: None,
+            toast: None,
+            cjk: false,
+            trail_color: config.trail_color_rgba(),
+            config_path: Config::path(&dll_dir),
+            config,
+            config_saved_at: Instant::now(),
         }
     }
 
@@ -386,6 +459,37 @@ impl MiniMap {
                         .uv_max(uv_max)
                         .build();
 
+                    // 已走路线，画在底图之上、图标之下。大地图是方的，交给
+                    // imgui 的裁剪矩形即可。
+                    if self.trail_enabled {
+                        let thickness = (window_size * TRAIL_WIDTH).max(1.5);
+                        draw_list.with_clip_rect(
+                            [map_offset_x, map_offset_y],
+                            [map_offset_x + map_size, map_offset_y + map_size],
+                            || {
+                                for seg in self.trail.segments(map.key.as_str()) {
+                                    let pts: Vec<[f32; 2]> = seg
+                                        .iter()
+                                        .map(|p| {
+                                            let o = self.get_icon_offset(
+                                                Pos2::new(p[0], p[1]),
+                                                [map_offset_x, map_offset_y],
+                                                &map_view,
+                                            );
+                                            [o.x, o.y]
+                                        })
+                                        .collect();
+                                    if pts.len() >= 2 {
+                                        draw_list
+                                            .add_polyline(pts, self.trail_color)
+                                            .thickness(thickness)
+                                            .build();
+                                    }
+                                }
+                            },
+                        );
+                    }
+
                     // 绘制地图图标
                     self.points
                         .get(map.level.as_str())
@@ -465,7 +569,7 @@ impl MiniMap {
 
                     // 分支署名，坐标见文件顶部的 CREDIT_* 常量
                     let credit_px = window_size * CREDIT_PX;
-                    ui.set_window_font_scale(credit_px / CREDIT_FONT_PX);
+                    ui.set_window_font_scale(credit_px / FONT_ATLAS_PX);
                     let text_size = ui.calc_text_size(FORK_CREDIT);
                     let text_pos = [
                         window_offset_x + window_size * CREDIT_X,
@@ -633,6 +737,43 @@ impl MiniMap {
                             .build();
                     }
 
+                    // 已走路线。小地图是圆的，折线得自己按圆裁剪。
+                    if self.trail_enabled {
+                        let radius = map_size / 2.0;
+                        let thickness = (window_size * TRAIL_WIDTH).max(1.5);
+                        let to_screen = |p: &[f32; 2]| -> [f32; 2] {
+                            if self.rotate_map {
+                                let wx = (p[0] - player.x) * scale_px;
+                                let wy = (p[1] - player.y) * scale_px;
+                                [
+                                    center_px.x + wx * rot_cos + wy * rot_sin,
+                                    center_px.y - wx * rot_sin + wy * rot_cos,
+                                ]
+                            } else {
+                                let o = self.get_icon_offset(
+                                    Pos2::new(p[0], p[1]),
+                                    [map_offset_x, map_offset_y],
+                                    &map_view,
+                                );
+                                [o.x, o.y]
+                            }
+                        };
+                        for seg in self.trail.segments(map.key.as_str()) {
+                            let pts: Vec<[f32; 2]> = seg.iter().map(|p| to_screen(p)).collect();
+                            let runs = clip_polyline_to_circle(
+                                &pts,
+                                [center_px.x, center_px.y],
+                                radius,
+                            );
+                            for run in runs {
+                                draw_list
+                                    .add_polyline(run, self.trail_color)
+                                    .thickness(thickness)
+                                    .build();
+                            }
+                        }
+                    }
+
                     // 绘制地图图标
                     self.points
                         .get(map.level.as_str())
@@ -742,8 +883,52 @@ impl MiniMap {
             if ui.is_key_down(Key::LeftShift) {
                 self.rotate_map = !self.rotate_map;
                 tracing::debug!("rotate_map: {}", self.rotate_map);
+                let msg = if self.rotate_map {
+                    self.msg(MSG_HEADING_UP)
+                } else {
+                    self.msg(MSG_NORTH_UP)
+                };
+                self.toast = Some((String::from(msg), Instant::now()));
             } else {
                 self.is_show = !self.is_show;
+            }
+        }
+        if ui.is_key_pressed_no_repeat(Key::Alpha9) {
+            if ui.is_key_down(Key::LeftShift) {
+                // 清除不可逆，要求在时限内按第二次。
+                let armed = self
+                    .trail_clear_armed
+                    .map(|t| t.elapsed().as_secs_f32() <= CLEAR_CONFIRM_SECS)
+                    .unwrap_or(false);
+                if armed {
+                    self.trail_clear_armed = None;
+                    self.trail.clear();
+                    self.toast = Some((String::from(self.msg(MSG_TRAIL_CLEARED)), Instant::now()));
+                } else {
+                    self.trail_clear_armed = Some(Instant::now());
+                    self.toast =
+                        Some((String::from(self.msg(MSG_TRAIL_CONFIRM)), Instant::now()));
+                }
+            } else {
+                self.trail_enabled = !self.trail_enabled;
+                // 暂停期间人是会走动的，但那段没被记录。不断开的话，恢复记录后
+                // 的第一个点会直接连到暂停前的最后一个点，画出一条并没走过的直线。
+                self.trail.cut();
+                if !self.trail_enabled {
+                    self.trail.save();
+                }
+                tracing::info!("trail_enabled: {}", self.trail_enabled);
+                let msg = if self.trail_enabled {
+                    format!(
+                        "{}  ({} {})",
+                        self.msg(MSG_TRAIL_ON),
+                        self.trail.total_points(),
+                        self.msg(MSG_POINTS)
+                    )
+                } else {
+                    String::from(self.msg(MSG_TRAIL_OFF))
+                };
+                self.toast = Some((msg, Instant::now()));
             }
         }
         if ui.is_key_pressed_no_repeat(Key::Tab) {
@@ -774,11 +959,177 @@ impl MiniMap {
         if self.game.playing {
             if self.is_show_main {
                 self.render_mainmap(ui);
+                self.render_help(ui);
             }
             if self.is_show {
                 self.render_minimap(ui);
             }
+            self.render_toast(ui);
         }
+    }
+
+    /// 把按键改动过的设置写回配置文件。
+    ///
+    /// 比较的是「上次落盘的值」而不是设一个 dirty 标志，这样按 `+` 又按 `-`
+    /// 回到原样就不会白写一次。节流是为了连按时不要每帧都落盘。
+    fn sync_config(&mut self) {
+        let current = Config {
+            size: self.size,
+            zoom: self.zoom,
+            rotate_map: self.rotate_map,
+            trail_enabled: self.trail_enabled,
+            // 颜色只读不写，原样带过去，否则这里会把用户手改的值覆盖掉。
+            trail_color: self.config.trail_color.clone(),
+        };
+        if current == self.config {
+            return;
+        }
+        if self.config_saved_at.elapsed().as_secs_f32() < CONFIG_SAVE_DELAY {
+            return;
+        }
+        self.config = current;
+        self.config_saved_at = Instant::now();
+        self.config.save(&self.config_path);
+    }
+
+    /// 有中文字形就用中文，否则用英文。
+    fn msg(&self, pair: (&'static str, &'static str)) -> &'static str {
+        if self.cjk {
+            pair.0
+        } else {
+            pair.1
+        }
+    }
+
+    /// 大地图右侧的按键说明。大地图左边是上游原有的图例，右边这一列是本分支加的。
+    ///
+    /// 和提示条一样用一个铺满屏幕的窗口来画：imgui 会把绘制裁剪到窗口矩形，
+    /// 窗口按内容大小去开的话，量错一点点文字就被切掉了。
+    fn render_help(&self, ui: &imgui::Ui) {
+        let [screen_width, screen_height] = ui.io().display_size;
+        let short_side = screen_width.min(screen_height);
+        let px = (short_side * 0.017).max(12.0);
+        let line_h = px * 1.6;
+        let pad = px * 0.9;
+        let gap = px * 1.2;
+
+        ui.window("wukong-minimap-help")
+            .size([screen_width, screen_height], Condition::Always)
+            .position([0.0, 0.0], Condition::Always)
+            .flags(
+                WindowFlags::NO_DECORATION
+                    | WindowFlags::NO_MOVE
+                    | WindowFlags::NO_INPUTS
+                    | WindowFlags::NO_NAV
+                    | WindowFlags::NO_BACKGROUND,
+            )
+            .build(|| {
+                let draw_list = ui.get_window_draw_list();
+                ui.set_window_font_scale(px / FONT_ATLAS_PX);
+
+                let title = self.msg(HELP_TITLE);
+                let rows: Vec<(&str, &str)> = HELP_ROWS
+                    .iter()
+                    .map(|(key, desc)| (*key, self.msg(*desc)))
+                    .collect();
+
+                // 键名一列按最宽的对齐，说明从同一个 x 开始。
+                let key_w = rows
+                    .iter()
+                    .map(|(k, _)| ui.calc_text_size(*k)[0])
+                    .fold(0.0f32, f32::max);
+                let desc_w = rows
+                    .iter()
+                    .map(|(_, d)| ui.calc_text_size(*d)[0])
+                    .fold(0.0f32, f32::max);
+                let content_w = (key_w + gap + desc_w).max(ui.calc_text_size(title)[0]);
+                let panel_w = content_w + pad * 2.0;
+                let panel_h = pad * 2.0 + line_h * (rows.len() as f32 + 1.4);
+
+                // 贴屏幕右缘，和小地图同一条边距；小地图开着的时候让到它下面，
+                // 关着就竖直居中。
+                let x = (screen_width - panel_w - 10.0).max(8.0);
+                let y = if self.is_show {
+                    10.0 + short_side * self.size + short_side * 0.055
+                } else {
+                    (screen_height - panel_h) / 2.0
+                };
+
+                draw_list
+                    .add_rect([x, y], [x + panel_w, y + panel_h], [0.0, 0.0, 0.0, 0.55])
+                    .filled(true)
+                    .rounding(px * 0.5)
+                    .build();
+
+                let text_x = x + pad;
+                draw_list.add_text([text_x, y + pad], [1.0, 0.86, 0.55, 0.95], title);
+
+                let mut row_y = y + pad + line_h * 1.4;
+                for (key, desc) in &rows {
+                    draw_list.add_text([text_x, row_y], [1.0, 1.0, 1.0, 0.7], *key);
+                    draw_list.add_text(
+                        [text_x + key_w + gap, row_y],
+                        [1.0, 1.0, 1.0, 0.95],
+                        *desc,
+                    );
+                    row_y += line_h;
+                }
+
+                ui.set_window_font_scale(1.0);
+            });
+    }
+
+    /// 屏幕提示，画在小地图正下方。
+    ///
+    /// 窗口占满屏幕宽度而不是只有小地图那么宽：imgui 会把绘制裁剪到窗口矩形，
+    /// 窗口一窄，长一点的文案就被切掉了。药丸本身仍以小地图中心对齐，只在快要
+    /// 超出屏幕时才让开。
+    fn render_toast(&self, ui: &imgui::Ui) {
+        let Some((msg, at)) = self.toast.as_ref() else {
+            return;
+        };
+        if at.elapsed().as_secs_f32() > TOAST_SECS {
+            return;
+        }
+
+        let [screen_width, screen_height] = ui.io().display_size;
+        let short_side = screen_width.min(screen_height);
+        let minimap_w = short_side * self.size;
+        let minimap_center_x = screen_width - minimap_w / 2.0 - 10.0;
+        let box_y = 10.0 + minimap_w + 6.0;
+        let px = (short_side * 0.016).max(12.0);
+
+        ui.window("wukong-minimap-toast")
+            .size([screen_width, px * 2.5], Condition::Always)
+            .position([0.0, box_y], Condition::Always)
+            .flags(
+                WindowFlags::NO_DECORATION
+                    | WindowFlags::NO_MOVE
+                    | WindowFlags::NO_INPUTS
+                    | WindowFlags::NO_NAV
+                    | WindowFlags::NO_BACKGROUND,
+            )
+            .build(|| {
+                let draw_list = ui.get_window_draw_list();
+                ui.set_window_font_scale(px / FONT_ATLAS_PX);
+                let size = ui.calc_text_size(msg.as_str());
+                let pad = px * 0.5;
+                let pill_w = size[0] + pad * 2.0;
+                let max_x = (screen_width - pill_w - 8.0).max(8.0);
+                let x = (minimap_center_x - pill_w / 2.0 + pad).clamp(8.0 + pad, max_x + pad);
+                let pos = [x, box_y + px * 0.5];
+                draw_list
+                    .add_rect(
+                        [pos[0] - pad, pos[1] - pad * 0.5],
+                        [pos[0] + size[0] + pad, pos[1] + size[1] + pad * 0.5],
+                        [0.0, 0.0, 0.0, 0.6],
+                    )
+                    .filled(true)
+                    .rounding((size[1] + pad) / 2.0)
+                    .build();
+                draw_list.add_text(pos, [1.0, 1.0, 1.0, 0.92], msg.as_str());
+                ui.set_window_font_scale(1.0);
+            });
     }
 }
 
@@ -786,14 +1137,48 @@ impl ImguiRenderLoop for MiniMap {
     fn initialize<'a>(&'a mut self, ctx: &mut Context, render_context: &'a mut dyn RenderContext) {
         let io = ctx.io_mut();
         io.mouse_draw_cursor = false;
-        // 按 CREDIT_FONT_PX 光栅化内置字体。不加这段时 imgui 会自己建一个
-        // 13px 的字体图集，署名在高分辨率下需要放大，糊得明显。
-        ctx.fonts().add_font(&[FontSource::DefaultFontData {
-            config: Some(FontConfig {
-                size_pixels: CREDIT_FONT_PX,
-                ..FontConfig::default()
-            }),
-        }]);
+        // 字体图集。不建的话 imgui 会自己塞一个 13px 的 ProggyClean，在高分辨率
+        // 下要放大好几倍，糊得明显；而且它只有 ASCII。
+        //
+        // 优先读一款系统中文字体（不打进 dll：中文字体十几 MB，而且多数不允许
+        // 随程序再分发），只烘焙提示条实际用到的那几十个字。读不到就退回内置
+        // 字体，提示条随之切成英文。
+        self.cjk = match font::load_cjk() {
+            Some((_, data)) => {
+                // 只烘焙真正会显示的字。以后改中文文案，记得让新字也走到这里，
+                // 否则新字会变成方块。
+                let mut texts = vec![
+                    MSG_TRAIL_ON.0,
+                    MSG_TRAIL_OFF.0,
+                    MSG_TRAIL_CONFIRM.0,
+                    MSG_TRAIL_CLEARED.0,
+                    MSG_HEADING_UP.0,
+                    MSG_NORTH_UP.0,
+                    MSG_POINTS.0,
+                    HELP_TITLE.0,
+                ];
+                texts.extend(HELP_ROWS.iter().map(|(_, desc)| desc.0));
+                let ranges = font::glyph_ranges_for(&texts);
+                ctx.fonts().add_font(&[FontSource::TtfData {
+                    data: &data,
+                    size_pixels: FONT_ATLAS_PX,
+                    config: Some(FontConfig {
+                        glyph_ranges: FontGlyphRanges::from_slice(ranges),
+                        ..FontConfig::default()
+                    }),
+                }]);
+                true
+            }
+            None => {
+                ctx.fonts().add_font(&[FontSource::DefaultFontData {
+                    config: Some(FontConfig {
+                        size_pixels: FONT_ATLAS_PX,
+                        ..FontConfig::default()
+                    }),
+                }]);
+                false
+            }
+        };
 
         let style = ctx.style_mut();
         style.window_rounding = 10.0;
@@ -870,7 +1255,19 @@ impl ImguiRenderLoop for MiniMap {
                 }
             }
             self.map = Some(map);
+            // 换图时先落盘，免得刚走完的一段因为崩溃丢掉。
+            self.trail.save();
+            // 再次进入同一个区域时，落脚点未必挨着上次离开的地方。
+            self.trail.cut();
         }
+
+        if self.trail_enabled && self.game.playing {
+            if let Some(key) = self.map.as_ref().map(|m| m.key.clone()) {
+                self.trail.record(&key, self.game.x, self.game.y);
+            }
+        }
+        self.trail.save_if_due();
+        self.sync_config();
     }
     fn render(&mut self, ui: &mut imgui::Ui) {
         self.render(ui);
