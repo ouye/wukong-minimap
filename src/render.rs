@@ -6,26 +6,25 @@
 // Changes: maps are loaded on demand instead of all at once; the nomap
 // placeholder is resized to match the map textures; replace_texture
 // failures are logged; added the heading-up minimap mode (Shift+0), the
-// walked trail (9 / Shift+9), persisted settings, on-screen messages in
-// Chinese where a system font provides it, and a fork credit line beside
-// upstream's logo on the big map.
+// walked trail (9 / Shift+9), the nearby-target radar (7 / 8 / Shift+8),
+// persisted settings, on-screen messages in Chinese where a system font
+// provides it, and a fork credit line beside upstream's logo on the big map.
 //
 // Upstream's own logo, baked into includes/mainwraper.png, is left exactly
 // as it is -- that asset is byte-identical to upstream.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Instant};
 
 use crate::{
     config::Config,
     font,
+    maploader::MapLoader,
     trail::{clip_polyline_to_circle, Trail},
     utils::{
-        get_dll_dir, image_with_bytes, image_with_file, is_in_map, load_data, load_points, MapInfo,
+        get_dll_dir, image_with_bytes, is_in_map, load_data, load_points, MapInfo,
         Point, Pos2,
     },
-    wukong::{self, GameState},
+    wukong::{self, ActorDot, GameState},
 };
 use gilrs::{GamepadId, Gilrs};
 use hudhook::{
@@ -37,6 +36,9 @@ use hudhook::{
     tracing,
 };
 use image::{EncodableLayout, ImageFormat, RgbaImage};
+
+/// 某个区域没有点位时用它，省掉每帧 `unwrap_or(&vec![])` 那次空分配。
+const NO_POINTS: &[Point] = &[];
 
 // 分支署名，画在大地图左下角、上游 logo 的右侧。
 //
@@ -60,6 +62,34 @@ const FONT_ATLAS_PX: f32 = 32.0;
 
 /// 线宽占 window_size 的比例，下限保证低分辨率下不至于细到看不见。
 const TRAIL_WIDTH: f32 = 0.0035;
+/// 雷达刷新间隔。每帧扫一遍 actor 列表没必要，人也不会移动那么快。
+const RADAR_INTERVAL: f32 = 0.2;
+/// 记号半径占 window_size 的比例。
+const DOT_RADIUS: f32 = 0.0095;
+/// 高度分带的阈值（世界单位，1 单位约 1cm）。悟空的地图垂直层次很多，
+/// 4 米上下基本就是"另一层"了。
+const Z_BAND: f32 = 400.0;
+/// 战斗中敌人呼吸一次的周期，秒。
+const ALERT_PERIOD: f32 = 0.9;
+/// 呼吸的半径区间，相对静止时的点半径。
+/// 平均比静止的点大一圈，本身就更醒目。
+const ALERT_SCALE_MIN: f32 = 0.7;
+const ALERT_SCALE_MAX: f32 = 1.7;
+
+/// 判定一个运行时发现的土地庙是否已经在静态点位表里：两个方向都在这个距离
+/// 之内就算同一个。土地庙之间隔得远，放宽一点不会误判。
+const MEDITATION_MATCH: f32 = 2000.0;
+/// 雷达的垂直搜索上限，世界单位。竖直塔（浮屠界）在俯视投影上是个细圆筒，
+/// 只按水平距离筛的话每一层的怪都会落进范围。差这么多层的目标本来也没用。
+const RADAR_Z_LIMIT: f32 = 4000.0;
+
+/// 一帧 16.7ms。任何一段超过这个毫秒数就记一条日志 —— 卡顿要靠数据定位，
+/// 不能靠猜。
+const SLOW_MS: f32 = 5.0;
+
+/// 雷达搜索半径相对小地图可视半径的余量，边缘目标提前进来一点，不会突然冒出。
+const RADAR_MARGIN: f32 = 1.15;
+
 /// 提示条停留时长。
 const TOAST_SECS: f32 = 3.0;
 /// `Shift`+`9` 二次确认的时限。
@@ -80,6 +110,12 @@ const MSG_TRAIL_CLEARED: (&str, &str) = ("路线已清除", "Trail cleared");
 const MSG_HEADING_UP: (&str, &str) = ("地图朝向：跟随人物", "Map: heading up");
 const MSG_NORTH_UP: (&str, &str) = ("地图朝向：正北朝上", "Map: north up");
 const MSG_POINTS: (&str, &str) = ("个点", "points");
+const MSG_ENEMY_ON: (&str, &str) = ("敌人红点：开", "Enemy dots ON");
+const MSG_ENEMY_OFF: (&str, &str) = ("敌人红点：关", "Enemy dots OFF");
+const MSG_NEUTRAL_ON: (&str, &str) = ("其他灰点：开", "Neutral dots ON");
+const MSG_NEUTRAL_OFF: (&str, &str) = ("其他灰点：关", "Neutral dots OFF");
+const MSG_ITEMS_ON: (&str, &str) = ("物品显示：开", "Items ON");
+const MSG_ITEMS_OFF: (&str, &str) = ("物品显示：关", "Items OFF");
 
 /// 大地图右侧那一列按键说明。左键名是 ASCII，右边的说明跟着字体走。
 const HELP_TITLE: (&str, &str) = ("按键说明", "Controls");
@@ -91,6 +127,9 @@ const HELP_ROWS: &[(&str, (&str, &str))] = &[
     ("Shift  0", ("地图朝向模式", "Map orientation")),
     ("9", ("路线记录开关", "Trail on / off")),
     ("Shift  9", ("清除全部路线", "Clear the trail")),
+    ("8", ("敌人红点开关", "Enemy dots")),
+    ("Shift  8", ("其他灰点开关", "Neutral dots")),
+    ("7", ("掉落物 / 采集物", "Items on the ground")),
 ];
 
 #[derive(Clone, Debug)]
@@ -169,10 +208,16 @@ pub struct MiniMap {
     gilrs: Mutex<Gilrs>,
     current_gamepad: Option<GamepadId>,
     textures: Textures,
-    map_images: HashMap<String, RgbaImage>,
+    /// 底图的后台解码器。换图不再阻塞渲染线程。
+    map_loader: MapLoader,
     zoom: f32,
     size: f32,
+    /// 玩家当前实际所在的区域。每帧判定，立刻跟进 —— 路线记录和雷达半径
+    /// 都要用它。
     map: Option<MapInfo>,
+    /// 屏幕上正在显示的那张图。底图解码好之前一直是上一张：显示的地形和
+    /// UV 换算始终对得上，只是慢一步，比整个游戏卡住一两秒强得多。
+    shown: Option<MapInfo>,
     maps: Vec<MapInfo>,
     points: HashMap<String, Vec<Point>>,
     game: GameState,
@@ -192,6 +237,19 @@ pub struct MiniMap {
     cjk: bool,
     /// 路线颜色。启动时从配置解析一次，`config.trail_color` 是它的来源。
     trail_color: [f32; 4],
+    /// 小地图上的红点/灰点。
+    show_enemies: bool,
+    show_neutrals: bool,
+    show_items: bool,
+    enemy_color: [f32; 4],
+    alert_color: [f32; 4],
+    neutral_color: [f32; 4],
+    drop_color: [f32; 4],
+    collect_color: [f32; 4],
+    interact_color: [f32; 4],
+    /// 上次刷新拿到的目标，按 RADAR_INTERVAL 节流刷新。
+    actors: Vec<ActorDot>,
+    actors_at: Instant,
     /// 上次落盘的设置，用来判断有没有改动。
     config: Config,
     config_path: PathBuf,
@@ -240,10 +298,6 @@ impl MiniMap {
             bianhua: png_texture!("../includes/icon_bianhua.png"),
         };
 
-        // Maps are loaded on demand in before_render, not all at once. The
-        // full set is 23 images; at 2000x2000 RGBA that would be 368 MB of
-        // resident memory for images the player is not looking at.
-        let map_images: HashMap<String, RgbaImage> = HashMap::new();
 
         let dll_dir = get_dll_dir();
         let config = Config::load(&dll_dir);
@@ -256,10 +310,13 @@ impl MiniMap {
             gilrs: Mutex::new(gilrs),
             current_gamepad: None,
             textures,
-            map_images,
+            // 底图按需解码，不是启动时全部读进来。整套 23 张在 2000×2000
+            // RGBA 下是 368 MB，而玩家同时只看得到一张。
+            map_loader: MapLoader::new(),
             zoom: config.zoom,
             size: config.size,
             map: None,
+            shown: None,
             maps,
             points,
             game: wukong::game_state(),
@@ -272,6 +329,17 @@ impl MiniMap {
             toast: None,
             cjk: false,
             trail_color: config.trail_color_rgba(),
+            show_enemies: config.show_enemies,
+            show_neutrals: config.show_neutrals,
+            show_items: config.show_items,
+            enemy_color: config.enemy_color_rgba(),
+            alert_color: config.alert_color_rgba(),
+            neutral_color: config.neutral_color_rgba(),
+            drop_color: config.drop_color_rgba(),
+            collect_color: config.collect_color_rgba(),
+            interact_color: config.interact_color_rgba(),
+            actors: Vec::new(),
+            actors_at: Instant::now(),
             config_path: Config::path(&dll_dir),
             config,
             config_saved_at: Instant::now(),
@@ -307,21 +375,18 @@ impl MiniMap {
                     };
                 }
                 false
-            })
-            .cloned();
+            });
 
+        // 这里每帧都跑。MapInfo 里有三个 String 和一个 Vec，原来无条件
+        // `.cloned()` 等于每帧白扔四次分配 —— 只有真的换图时才需要那份拷贝。
         match (self.map.as_ref(), map) {
-            (_, None) => {
-                return None;
-            }
-            (None, Some(new_map)) => {
-                return Some(new_map);
-            }
+            (_, None) => None,
+            (None, Some(new_map)) => Some(new_map.clone()),
             (Some(current_map), Some(new_map)) => {
                 if current_map.key != new_map.key {
-                    return Some(new_map);
+                    Some(new_map.clone())
                 } else {
-                    return None;
+                    None
                 }
             }
         }
@@ -438,7 +503,7 @@ impl MiniMap {
                 ui.set_cursor_pos([0.0, 0.0]);
                 let draw_list = ui.get_window_draw_list();
 
-                if let Some(map) = self.map.as_ref() {
+                if let Some(map) = self.shown.as_ref() {
                     // 绘制地图
                     let map_image = self.textures.map.id.unwrap();
                     let map_offset_x = window_offset_x + (window_size - map_size) / 2.0;
@@ -493,7 +558,8 @@ impl MiniMap {
                     // 绘制地图图标
                     self.points
                         .get(map.level.as_str())
-                        .unwrap_or(&vec![])
+                        .map(Vec::as_slice)
+                        .unwrap_or(NO_POINTS)
                         .iter()
                         .filter(|point| is_in_map(point, &map))
                         .for_each(|point| {
@@ -650,7 +716,7 @@ impl MiniMap {
                 ui.set_cursor_pos([0.0, 0.0]);
                 let draw_list = ui.get_window_draw_list();
 
-                if let Some(map) = self.map.as_ref() {
+                if let Some(map) = self.shown.as_ref() {
                     // 绘制地图
                     let map_image = self.textures.map.id.unwrap();
                     let map_offset_x = window_offset_x + (window_size - map_size) / 2.0;
@@ -737,28 +803,46 @@ impl MiniMap {
                             .build();
                     }
 
+                    // 世界坐标 -> 屏幕坐标。路线和周边目标共用同一套变换。
+                    let radius = map_size / 2.0;
+                    let to_screen = |p: &[f32; 2]| -> [f32; 2] {
+                        if self.rotate_map {
+                            let wx = (p[0] - player.x) * scale_px;
+                            let wy = (p[1] - player.y) * scale_px;
+                            [
+                                center_px.x + wx * rot_cos + wy * rot_sin,
+                                center_px.y - wx * rot_sin + wy * rot_cos,
+                            ]
+                        } else {
+                            let o = self.get_icon_offset(
+                                Pos2::new(p[0], p[1]),
+                                [map_offset_x, map_offset_y],
+                                &map_view,
+                            );
+                            [o.x, o.y]
+                        }
+                    };
+
                     // 已走路线。小地图是圆的，折线得自己按圆裁剪。
                     if self.trail_enabled {
-                        let radius = map_size / 2.0;
                         let thickness = (window_size * TRAIL_WIDTH).max(1.5);
-                        let to_screen = |p: &[f32; 2]| -> [f32; 2] {
-                            if self.rotate_map {
-                                let wx = (p[0] - player.x) * scale_px;
-                                let wy = (p[1] - player.y) * scale_px;
-                                [
-                                    center_px.x + wx * rot_cos + wy * rot_sin,
-                                    center_px.y - wx * rot_sin + wy * rot_cos,
-                                ]
-                            } else {
-                                let o = self.get_icon_offset(
-                                    Pos2::new(p[0], p[1]),
-                                    [map_offset_x, map_offset_y],
-                                    &map_view,
-                                );
-                                [o.x, o.y]
-                            }
+
+                        // 先在世界坐标里粗筛。一张图上的路线点长时间游玩后能有
+                        // 上万个，而小地图一次只看得到很小一块 —— 整段都在视野
+                        // 外就直接跳过，省掉逐点变换和那次 Vec 分配。判定只有
+                        // 两次减法两次乘法，比变换本身便宜得多。
+                        let view_r = radius / scale_px * 1.2;
+                        let view_r2 = view_r * view_r;
+                        let near = |p: &[f32; 2]| {
+                            let dx = p[0] - player.x;
+                            let dy = p[1] - player.y;
+                            dx * dx + dy * dy <= view_r2
                         };
+
                         for seg in self.trail.segments(map.key.as_str()) {
+                            if !seg.iter().any(|p| near(p)) {
+                                continue;
+                            }
                             let pts: Vec<[f32; 2]> = seg.iter().map(|p| to_screen(p)).collect();
                             let runs = clip_polyline_to_circle(
                                 &pts,
@@ -774,10 +858,135 @@ impl MiniMap {
                         }
                     }
 
+                    // 周边目标。画在路线之上、点位图标之下 —— 图标是静态信息，
+                    // 这些是当下的，不该被盖住，但也不该盖掉传送点。
+                    //
+                    // 两条互不干扰的视觉通道：
+                    //   形状 = 是什么   圆 = 角色，菱形 = 地上的东西
+                    //   填充 = 高度差   空心 = 在你下方，实心 = 同层，
+                    //                   实心加外环 = 在你上方
+                    // 颜色再区分具体类别，以及敌人有没有发现你。视觉重量随高度
+                    // 递增，一眼能看出够不够得着。
+                    if !self.actors.is_empty() {
+                        let dot_r = (window_size * DOT_RADIUS).max(1.8);
+                        // 呼吸到最大、又在上方一层的话，外环会到 2 倍半径，
+                        // 裁剪半径要留够，否则贴边的目标被切掉半圈。
+                        let limit = radius - dot_r * ALERT_SCALE_MAX * 2.0;
+                        let player_z = self.game.z;
+
+                        // 已经发现你的敌人：点自己缩小再弹回，循环。
+                        //
+                        // 颜色差在这个尺寸上读不出来 —— 那是个绝对差异，没有
+                        // 参照就分辨不了，而两种状态的红点几乎不会同时出现。
+                        // 运动不一样：小地图是用余光看的，而余光对颜色和形状
+                        // 迟钝、对变化极其敏感。
+                        //
+                        // 只动半径、不动填充：空心/实心已经用来表示高度了，
+                        // 让它跟着呼吸的话，战斗中的怪会有一半时间看起来像在
+                        // 你楼下 —— 而这些恰恰是最需要知道同不同层的那些。
+                        //
+                        // 所有战斗中的敌人共用一个相位，同步呼吸是一个整体
+                        // 信号，比各自随机闪更容易被捕捉到。
+                        let phase = (ui.time() as f32) / ALERT_PERIOD * std::f32::consts::TAU;
+                        let alert_r = dot_r
+                            * (ALERT_SCALE_MIN
+                                + (ALERT_SCALE_MAX - ALERT_SCALE_MIN) * (0.5 + 0.5 * phase.sin()));
+
+                        let draw_marker = |p: [f32; 2], r: f32, color: [f32; 4], dz: f32, diamond: bool| {
+                            let below = dz < -Z_BAND;
+                            let above = dz > Z_BAND;
+                            let edge = (r * 0.6).max(1.0);
+
+                            if diamond {
+                                let d = r * 1.3;
+                                let mut pts = vec![
+                                    [p[0], p[1] - d],
+                                    [p[0] + d, p[1]],
+                                    [p[0], p[1] + d],
+                                    [p[0] - d, p[1]],
+                                ];
+                                if below {
+                                    // 描边要自己闭合，add_polyline 不填充时是开口的。
+                                    pts.push(pts[0]);
+                                    draw_list.add_polyline(pts, color).thickness(edge).build();
+                                } else {
+                                    draw_list.add_polyline(pts, color).filled(true).build();
+                                }
+                            } else if below {
+                                draw_list
+                                    .add_circle(p, r, color)
+                                    .thickness(edge)
+                                    .num_segments(12)
+                                    .build();
+                            } else {
+                                draw_list
+                                    .add_circle(p, r, color)
+                                    .filled(true)
+                                    .num_segments(12)
+                                    .build();
+                            }
+
+                            if above {
+                                draw_list
+                                    .add_circle(p, r * 2.0, color)
+                                    .thickness((r * 0.4).max(0.9))
+                                    .num_segments(16)
+                                    .build();
+                            }
+                        };
+
+                        for actor in &self.actors {
+                            let p = to_screen(&[actor.x, actor.y]);
+                            let dx = p[0] - center_px.x;
+                            let dy = p[1] - center_px.y;
+                            if dx * dx + dy * dy > limit * limit {
+                                continue;
+                            }
+                            let dz = actor.z - player_z;
+
+                            match actor.kind {
+                                wukong::KIND_HOSTILE => {
+                                    if actor.in_battle() {
+                                        draw_marker(p, alert_r, self.alert_color, dz, false);
+                                    } else {
+                                        draw_marker(p, dot_r, self.enemy_color, dz, false);
+                                    }
+                                }
+                                wukong::KIND_NEUTRAL => {
+                                    draw_marker(p, dot_r, self.neutral_color, dz, false)
+                                }
+                                wukong::KIND_DROP => {
+                                    draw_marker(p, dot_r, self.drop_color, dz, true)
+                                }
+                                wukong::KIND_COLLECT => {
+                                    draw_marker(p, dot_r, self.collect_color, dz, true)
+                                }
+                                wukong::KIND_MEDITATION => {
+                                    // 静态点位表里已经有的土地庙不重复画；漏掉的
+                                    // 用同一个传送点图标补上，看起来才是一套的。
+                                    if !self.has_static_teleport(map, actor.x, actor.y) {
+                                        if let Some(id) = self.textures.teleport.id {
+                                            let half = icon_size_half * 0.85;
+                                            draw_list
+                                                .add_image(
+                                                    id,
+                                                    [p[0] - half, p[1] - half],
+                                                    [p[0] + half, p[1] + half],
+                                                )
+                                                .build();
+                                        }
+                                    }
+                                }
+                                _ => draw_marker(p, dot_r, self.interact_color, dz, true),
+                            }
+                        }
+                    }
+
                     // 绘制地图图标
                     self.points
                         .get(map.level.as_str())
-                        .unwrap_or(&vec![])
+                        .map(Vec::as_slice)
+                        .unwrap_or(NO_POINTS)
                         .iter()
                         .filter(|point| is_in_map(point, &map))
                         .for_each(|point| {
@@ -893,6 +1102,39 @@ impl MiniMap {
                 self.is_show = !self.is_show;
             }
         }
+        if ui.is_key_pressed_no_repeat(Key::Alpha7) {
+            self.show_items = !self.show_items;
+            tracing::info!("radar: items={}", self.show_items);
+            let msg = if self.show_items {
+                MSG_ITEMS_ON
+            } else {
+                MSG_ITEMS_OFF
+            };
+            self.toast = Some((String::from(self.msg(msg)), Instant::now()));
+        }
+        if ui.is_key_pressed_no_repeat(Key::Alpha8) {
+            let msg = if ui.is_key_down(Key::LeftShift) {
+                self.show_neutrals = !self.show_neutrals;
+                if self.show_neutrals {
+                    MSG_NEUTRAL_ON
+                } else {
+                    MSG_NEUTRAL_OFF
+                }
+            } else {
+                self.show_enemies = !self.show_enemies;
+                if self.show_enemies {
+                    MSG_ENEMY_ON
+                } else {
+                    MSG_ENEMY_OFF
+                }
+            };
+            tracing::info!(
+                "radar: enemies={} neutrals={}",
+                self.show_enemies,
+                self.show_neutrals
+            );
+            self.toast = Some((String::from(self.msg(msg)), Instant::now()));
+        }
         if ui.is_key_pressed_no_repeat(Key::Alpha9) {
             if ui.is_key_down(Key::LeftShift) {
                 // 清除不可逆，要求在时限内按第二次。
@@ -968,6 +1210,78 @@ impl MiniMap {
         }
     }
 
+    /// 这个坐标附近是否已经有一个静态传送点。
+    ///
+    /// 运行时能发现所有土地庙，但 `data_points.json` 里手工采的那些已经画出来了，
+    /// 重复画两个图标反而更乱。只补表里漏掉的。
+    fn has_static_teleport(&self, map: &MapInfo, x: f32, y: f32) -> bool {
+        self.points
+            .get(map.level.as_str())
+            .map(|points| {
+                points.iter().any(|point| {
+                    point.category == "teleport"
+                        && (point.x - x).abs() < MEDITATION_MATCH
+                        && (point.y - y).abs() < MEDITATION_MATCH
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// 按 RADAR_INTERVAL 节流刷新周边目标。
+    ///
+    /// 搜索半径跟着小地图当前的可视范围走：比例调小了就少扫一些，没必要把
+    /// 半张图的 actor 都过一遍。
+    fn refresh_radar(&mut self) {
+        let mask = self.radar_mask();
+        if mask == 0 {
+            self.actors.clear();
+            return;
+        }
+        if !self.game.playing {
+            return;
+        }
+        if self.actors_at.elapsed().as_secs_f32() < RADAR_INTERVAL {
+            return;
+        }
+        self.actors_at = Instant::now();
+
+        let radius = match self.map.as_ref() {
+            Some(map) => {
+                let full_w = (map.range.end[0] - map.range.start[0]).abs();
+                full_w * self.zoom / 2.0 * RADAR_MARGIN
+            }
+            None => return,
+        };
+        wukong::nearby_actors(radius, RADAR_Z_LIMIT, mask, &mut self.actors);
+
+        // IsUnitInBattle 在自动化测试的辅助库里，正式版未必留着。这条能直接
+        // 看出它到底有没有生效：一直是 0 就说明拿不到战斗状态。
+        let in_battle = self.actors.iter().filter(|a| a.in_battle()).count();
+        tracing::debug!(
+            "radar: {} dots, {} in battle",
+            self.actors.len(),
+            in_battle
+        );
+    }
+
+    /// 要收集哪些类别。关掉的类别在 C++ 侧连一次 `IsA` 都不会做。
+    fn radar_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        if self.show_enemies {
+            mask |= 1 << wukong::KIND_HOSTILE;
+        }
+        if self.show_neutrals {
+            mask |= 1 << wukong::KIND_NEUTRAL;
+        }
+        if self.show_items {
+            mask |= (1 << wukong::KIND_DROP)
+                | (1 << wukong::KIND_COLLECT)
+                | (1 << wukong::KIND_MEDITATION)
+                | (1 << wukong::KIND_INTERACT);
+        }
+        mask
+    }
+
     /// 把按键改动过的设置写回配置文件。
     ///
     /// 比较的是「上次落盘的值」而不是设一个 dirty 标志，这样按 `+` 又按 `-`
@@ -978,8 +1292,17 @@ impl MiniMap {
             zoom: self.zoom,
             rotate_map: self.rotate_map,
             trail_enabled: self.trail_enabled,
+            show_enemies: self.show_enemies,
+            show_neutrals: self.show_neutrals,
+            show_items: self.show_items,
             // 颜色只读不写，原样带过去，否则这里会把用户手改的值覆盖掉。
             trail_color: self.config.trail_color.clone(),
+            enemy_color: self.config.enemy_color.clone(),
+            alert_color: self.config.alert_color.clone(),
+            neutral_color: self.config.neutral_color.clone(),
+            drop_color: self.config.drop_color.clone(),
+            collect_color: self.config.collect_color.clone(),
+            interact_color: self.config.interact_color.clone(),
         };
         if current == self.config {
             return;
@@ -1155,6 +1478,12 @@ impl ImguiRenderLoop for MiniMap {
                     MSG_HEADING_UP.0,
                     MSG_NORTH_UP.0,
                     MSG_POINTS.0,
+                    MSG_ENEMY_ON.0,
+                    MSG_ENEMY_OFF.0,
+                    MSG_NEUTRAL_ON.0,
+                    MSG_NEUTRAL_OFF.0,
+                    MSG_ITEMS_ON.0,
+                    MSG_ITEMS_OFF.0,
                     HELP_TITLE.0,
                 ];
                 texts.extend(HELP_ROWS.iter().map(|(_, desc)| desc.0));
@@ -1232,35 +1561,48 @@ impl ImguiRenderLoop for MiniMap {
         _ctx: &mut Context,
         render_context: &'a mut dyn RenderContext,
     ) {
-        let map = self.update_map();
-        if let Some(map) = map {
+        let t_start = Instant::now();
+
+        // 逻辑区域立刻跟进：路线要记到正确的那张图上，雷达半径也跟着走。
+        if let Some(map) = self.update_map() {
             tracing::debug!("update map: {} at {:?}", map.key, (self.game.x, self.game.y));
-
-            // Load on demand and keep only the current map resident.
-            if !self.map_images.contains_key(map.key.as_str()) {
-                self.map_images.clear();
-                if let Some(img) = image_with_file(map.key.as_str()) {
-                    self.map_images.insert(map.key.clone(), img);
-                }
-            }
-
-            if let Some(map_image) = self.map_images.get(map.key.as_str()) {
-                if let Err(e) = render_context.replace_texture(
-                    self.textures.map.id.unwrap(),
-                    map_image.as_bytes(),
-                    map_image.width(),
-                    map_image.height(),
-                ) {
-                    tracing::error!("replace_texture failed for {}: {e:?}", map.key);
-                }
-            }
             self.map = Some(map);
-            // 换图时先落盘，免得刚走完的一段因为崩溃丢掉。
-            self.trail.save();
+            // 换图时落盘，免得刚走完的一段因为崩溃丢掉。塔类关卡跨层很频繁，
+            // 所以这里是节流版本，不是每次都真的写。
+            self.trail.save_on_map_change();
             // 再次进入同一个区域时，落脚点未必挨着上次离开的地方。
             self.trail.cut();
         }
+        let t_map = t_start.elapsed();
 
+        // 底图换成后台解码。解码一张 2000×2000 的 webp 要几百毫秒到一两秒，
+        // 而 before_render 跑在渲染线程上 —— 原来同步做这件事，每次跨层整个
+        // 画面就停住。小西天按高度切成 5 张图，在浮屠界的圆筒里跑上跑下会
+        // 反复触发。
+        //
+        // 现在解码交给工作线程，图没好之前继续显示上一张（`shown` 不动，
+        // 地形和 UV 换算始终自洽），好了再上传纹理、一次切过去。
+        let t_upload_start = Instant::now();
+        self.map_loader.poll();
+        let want = self.map.as_ref().map(|map| map.key.clone());
+        if let Some(key) = want {
+            if self.shown.as_ref().map(|m| m.key.as_str()) != Some(key.as_str()) {
+                if let Some(image) = self.map_loader.get(&key) {
+                    match render_context.replace_texture(
+                        self.textures.map.id.unwrap(),
+                        image.as_bytes(),
+                        image.width(),
+                        image.height(),
+                    ) {
+                        Ok(()) => self.shown = self.map.clone(),
+                        Err(e) => tracing::error!("replace_texture failed for {key}: {e:?}"),
+                    }
+                }
+            }
+        }
+        let t_upload = t_upload_start.elapsed();
+
+        let t_trail_start = Instant::now();
         if self.trail_enabled && self.game.playing {
             if let Some(key) = self.map.as_ref().map(|m| m.key.clone()) {
                 self.trail.record(&key, self.game.x, self.game.y);
@@ -1268,9 +1610,33 @@ impl ImguiRenderLoop for MiniMap {
         }
         self.trail.save_if_due();
         self.sync_config();
+        let t_trail = t_trail_start.elapsed();
+
+        let t_radar_start = Instant::now();
+        self.refresh_radar();
+        let t_radar = t_radar_start.elapsed();
+
+        // 哪一段拖慢了帧，日志里直接能看到。默认级别就记，不用开 debug ——
+        // 出现卡顿时用户手上就有数据。
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        let total = ms(t_start.elapsed());
+        if total >= SLOW_MS {
+            tracing::info!(
+                "slow before_render: {total:.1} ms (map {:.1}, texture {:.1}, trail {:.1}, radar {:.1})",
+                ms(t_map),
+                ms(t_upload),
+                ms(t_trail),
+                ms(t_radar),
+            );
+        }
     }
     fn render(&mut self, ui: &mut imgui::Ui) {
+        let started = Instant::now();
         self.render(ui);
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        if ms >= SLOW_MS {
+            tracing::info!("slow render: {ms:.1} ms");
+        }
         // ui.show_demo_window(&mut true);
     }
 }

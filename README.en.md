@@ -13,7 +13,7 @@
 > mode and a record of where you have walked. The minimap's gameplay and visual
 > design are untouched.
 >
-> The full record of what changed is in [CHANGES.md](./CHANGES.md).
+> Every modified file carries a header saying what changed in it and where it came from.
 
 - Download: [releases](https://github.com/Ouye/wukong-minimap/releases)
 - Original project: [jaskang/wukong-minimap](https://github.com/jaskang/wukong-minimap) · [BiliBili demo video](https://www.bilibili.com/video/BV1Y1KueREho/) · [Nexusmods](https://www.nexusmods.com/blackmythwukong/mods/1172)
@@ -42,6 +42,14 @@ from 368 MB to 16 MB, and the install package from 96 MB to 23 MB.
 
 ## Changelog
 
+- v2.2 (this fork)
+  - Fixed the 1-3 second stall when crossing a map boundary (worst in the pagoda):
+    map images are now decoded on a worker thread
+  - Markers now show relative height: hollow below, solid same level, solid + ring above
+  - Enemies that have noticed you pulse
+  - Items on the ground — drops and collectibles (`7`)
+- v2.1 (this fork)
+  - Nearby targets on the minimap: red dots for hostiles (`8`), grey for neutrals (`Shift` + `8`)
 - v2.0 (this fork)
   - Works on game versions after 1.0.20
   - Fixed the garbled minimap texture
@@ -73,19 +81,46 @@ so you do not have to come back here for it.
   - Toggled: the arrow is locked pointing up, the map turns with the character
 - `9` Toggle the walked trail **(new in this fork)** — off means neither drawn nor recorded
 - `Shift` + `9` Clear the whole trail **(new in this fork)** — not undoable; press a second time within 3 seconds to confirm
+- `7` Toggle items on the ground — drops, collectibles **(new in this fork)** — off by default
+- `8` Toggle red dots for nearby hostiles **(new in this fork)**
+- `Shift` + `8` Toggle grey dots for neutrals **(new in this fork)** — off by default
+
+Markers on the minimap use two independent channels:
+
+| | Meaning |
+|---|---|
+| **Circle** | A character (enemy, NPC) |
+| **Diamond** | Something on the ground (a drop, a collectible) |
+| **Hollow** | One floor **below** you |
+| **Solid** | On **your** level |
+| **Solid + ring** | One floor **above** you |
+
+Colour then says which kind: red for enemies, grey for neutrals, gold for drops, green
+for collectibles, white for other interactables. A shrine found at runtime is drawn with
+the usual teleport icon, but only when the built-in point list is missing it.
+
+**An enemy that has noticed you pulses — its dot shrinks and springs back.** You watch the
+minimap out of the corner of your eye, and peripheral vision is poor at colour but very
+good at motion — so combat state is animated rather than coloured.
 
 These settings — window size, scale, orientation and the trail toggle — are kept in
 `wukong_minimap_config.json` next to the dll and restored on the next launch. Delete
 that file to go back to the defaults.
 
-That file also holds the trail colour, which is edit-by-hand only:
+That file also holds three colours, edit-by-hand only:
 
 ```json
-"trail_color": "#22E0FFCC"
+"trail_color":    "#22E0FFCC",
+"enemy_color":    "#C2352BCC",
+"alert_color":    "#FF4438FF",
+"neutral_color":  "#C8C8C8A0",
+"drop_color":     "#FFC93CEE",
+"collect_color":  "#5BD86BE0",
+"interact_color": "#E0E0E0B4"
 ```
 
 `#RRGGBB` or `#RRGGBBAA` (the last two digits are opacity). Restart the game to apply.
-A malformed value falls back to the built-in cyan and says so in the log.
+A malformed value falls back to the built-in colour and the log says which field.
 
 The trail is recorded per map area and kept in `wukong_minimap_trails.json` next
 to the dll, reloaded on the next launch. Copy that file to back it up, delete it

@@ -5,8 +5,6 @@
 //
 // Records where the player has walked, per map area, and persists it next to
 // the dll so the trail survives across sessions.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +26,10 @@ const MAX_POINTS: usize = 20000;
 
 /// 存盘节流间隔。
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 换图时落盘的最小间隔。塔类关卡（浮屠界）按高度切成好几张图，跨层非常
+/// 频繁，每次都序列化 + 写盘会累在渲染线程上。
+const MAP_CHANGE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const FILE_NAME: &str = "wukong_minimap_trails.json";
 
@@ -199,6 +201,14 @@ impl Trail {
                 tracing::info!("trail: cleared")
             }
             Err(e) => tracing::error!("trail: could not remove {}: {e}", self.path.display()),
+        }
+    }
+
+    /// 换图时落盘。比常规节流积极，但不是每次都真的写 —— 见
+    /// `MAP_CHANGE_SAVE_INTERVAL`。
+    pub fn save_on_map_change(&mut self) {
+        if self.dirty && self.last_save.elapsed() >= MAP_CHANGE_SAVE_INTERVAL {
+            self.save();
         }
     }
 

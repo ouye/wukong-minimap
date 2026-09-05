@@ -9,8 +9,6 @@
 // b1Init() can fill them from a runtime signature scan; GWorld is forced to
 // 0 so UWorld::GetWorld() uses the GObjects-walking fallback rather than a
 // hard-coded pointer; the 21 MB Assertions.inl can be stubbed out.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 #pragma once
 

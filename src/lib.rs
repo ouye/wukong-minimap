@@ -5,8 +5,6 @@
 //
 // Changes: log the build version and both repository URLs at startup, so a
 // user-submitted log file identifies which build produced it.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 use std::fs::File;
 use std::{ffi, panic, thread, time};
@@ -18,6 +16,7 @@ use utils::{get_dll_dir, setup_tracing};
 
 mod config;
 mod font;
+mod maploader;
 mod render;
 mod trail;
 mod utils;

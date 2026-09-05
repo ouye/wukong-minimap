@@ -7,10 +7,9 @@
 //
 // Changes: track resource state so re-uploads are legal; keep textures in
 // COMMON for cross-queue ownership transfer; use GetCopyableFootprints;
-// upload through a CPU-writable CUSTOM heap with WriteToSubresource; clamp
-// alpha 255 -> 254 to work around opaque-texture corruption on this game.
-//
-// See CHANGES.md for the full record of what was changed and why.
+// upload small textures through a CPU-writable CUSTOM heap; clamp alpha
+// 255 -> 254 to work around opaque-texture corruption on this game, and only
+// copy the pixel data when that clamp actually has something to do.
 
 // NOTE: see this for ManuallyDrop instances https://github.com/microsoft/windows-rs/issues/2386
 
@@ -31,6 +30,17 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use crate::renderer::RenderEngine;
 use crate::util::{self, Fence};
 use crate::RenderContext;
+
+/// Above this many texels a texture is uploaded through an upload buffer plus
+/// CopyTextureRegion instead of WriteToSubresource.
+///
+/// WriteToSubresource makes the CPU do the linear -> tiled swizzle, and the
+/// resulting write pattern is scattered, which defeats write combining on the
+/// WRITE_COMBINE heap the resource lives on. For a few hundred KB that is
+/// irrelevant; for the 16 MB minimap texture it costs hundreds of milliseconds
+/// to seconds, on the render thread. The upload-buffer path writes the staging
+/// copy sequentially and lets the GPU do the swizzle.
+const CPU_WRITABLE_MAX_TEXELS: u64 = 512 * 512;
 
 pub struct D3D12RenderEngine {
     device: ID3D12Device,
@@ -835,6 +845,10 @@ impl TextureHeap {
         })
         .ok();
 
+        // 大纹理不走 CPU 重排，见 CPU_WRITABLE_MAX_TEXELS。
+        let small_enough = (width as u64) * (height as u64) <= CPU_WRITABLE_MAX_TEXELS;
+        let custom = if small_enough { custom } else { None };
+
         let cpu_writable = custom.is_some();
         if cpu_writable {
             debug!("create_texture {width}x{height}: CPU-writable CUSTOM heap");
@@ -940,6 +954,10 @@ impl TextureHeap {
 
         // WORKAROUND: clamp alpha 255 -> 254.
         //
+        // 先只读扫一遍再决定要不要拷贝：这个函数每次换图都要处理 16 MB，
+        // 无条件 to_vec() 等于一次 16 MB 分配加一次 16 MB 拷贝，全在渲染
+        // 线程上。地图那边已经在解码线程里夹好了，扫一遍就直接用原数据。
+        //
         // On this game + driver, any texel uploaded with alpha == 255 comes
         // back from the sampler scrambled, while the identical pixels uploaded
         // with alpha == 200 sample perfectly. Verified in both directions: the
@@ -953,13 +971,19 @@ impl TextureHeap {
         // (1.0.20 integrated FSR4 frame generation) treating fully-opaque
         // overlay pixels as something to reproject. 254 vs 255 is a 0.4%
         // opacity difference -- invisible -- and it sidesteps the whole thing.
-        let mut clamped = data.to_vec();
-        for px in clamped.chunks_exact_mut(4) {
-            if px[3] == 255 {
-                px[3] = 254;
+        let clamped: Vec<u8>;
+        let data: &[u8] = if data.chunks_exact(4).any(|px| px[3] == 255) {
+            let mut owned = data.to_vec();
+            for px in owned.chunks_exact_mut(4) {
+                if px[3] == 255 {
+                    px[3] = 254;
+                }
             }
-        }
-        let data: &[u8] = &clamped;
+            clamped = owned;
+            &clamped
+        } else {
+            data
+        };
 
         // CPU-writable path: hand the rows straight to the driver and let it do
         // the linear -> tiled conversion. No upload buffer, no command list, no

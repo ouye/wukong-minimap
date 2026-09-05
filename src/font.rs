@@ -5,8 +5,6 @@
 //
 // Finds a Chinese font on the machine and works out the minimal set of glyphs
 // to bake, so the overlay can print Chinese without shipping a font.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 use std::path::Path;
 

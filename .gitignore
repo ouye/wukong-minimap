@@ -29,3 +29,8 @@ b1sdk/build/
 # Packaging output
 dist/wukong-minimap-*/
 dist/*.zip
+
+# 改动记录只在本地留着，不进仓库。Apache-2.0 第 4(b) 条要的是
+# "modified files carry prominent notices" —— 每个改过的文件顶部那段头注释
+# 已经满足了。
+CHANGES.md

@@ -6,8 +6,6 @@
 // Changes: image_with_file returns Option instead of panicking (it is now
 // called during gameplay); default log level lowered to errors only, plus
 // this crate's startup banner.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 use hudhook::tracing;
 use image::{ImageFormat, ImageReader, RgbaImage};

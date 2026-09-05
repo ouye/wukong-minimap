@@ -7,8 +7,6 @@
 //
 // Changes: Fence starts at 1, not 0 -- with 0 the first Signal/wait pair on
 // every fence was a no-op and the first GPU submission was never waited for.
-//
-// See CHANGES.md for the full record of what was changed and why.
 
 //! General-purpose utilities. These are used across the [`crate`] but have
 //! proven useful in client code as well.
